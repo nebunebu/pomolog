@@ -1,0 +1,15 @@
+name = "Paper"
+mode = "light"
+radius = 6
+
+[colors]
+bg = "#f7f3ea"
+surface = "#fffdf7"
+text = "#2b2a27"
+accent = "#b4472e"
+on_accent = "#ffffff"
+success = "#3f7d4e"
+warning = "#a86a00"
+danger = "#b3261e"
+appointment = "#2f6f9f"
+long_break = "#5b6fb5"

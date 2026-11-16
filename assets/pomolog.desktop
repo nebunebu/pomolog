@@ -1,0 +1,20 @@
+[Desktop Entry]
+Type=Application
+Name=Pomolog
+GenericName=Pomodoro Timer
+Comment=Pomodoro timer with kanban, calendar, habits and analytics
+Exec=pomolog
+Icon=pomolog
+Terminal=false
+Categories=Office;ProjectManagement;Utility;
+Keywords=pomodoro;timer;kanban;habit;calendar;focus;
+StartupWMClass=pomolog
+Actions=toggle;skip;
+
+[Desktop Action toggle]
+Name=Start or pause the timer
+Exec=pomolog toggle
+
+[Desktop Action skip]
+Name=Skip to the next phase
+Exec=pomolog skip
