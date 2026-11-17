@@ -3,7 +3,7 @@
 use super::app::{App, ConfirmAction, El, Field, Message, Modal, Toggle};
 use super::shell::{action, field, icon_btn, labelled, page, section, vscroll};
 use super::style::{self, Btn, P, btn};
-use crate::config::{self, Mode, Source};
+use crate::config::{self, Clock, Mode, Source};
 use crate::core::export;
 use crate::theme::{Colors, Rgb};
 use iced::widget::{
@@ -20,6 +20,12 @@ impl App {
             Toggle::Compact => self.cfg.appearance.compact = on,
             Toggle::Notifications => self.cfg.notifications.enabled = on,
             Toggle::DailySummary => self.cfg.notifications.daily_summary = on,
+            Toggle::Sounds => self.cfg.sounds.enabled = on,
+            Toggle::SoundFocusEnd => self.cfg.sounds.focus_end = on,
+            Toggle::SoundBreakEnd => self.cfg.sounds.break_end = on,
+            Toggle::SoundAutoStart => self.cfg.sounds.auto_start = on,
+            Toggle::SoundWarning => self.cfg.sounds.minute_warning = on,
+            Toggle::Vim => self.cfg.keys.vim = on,
             Toggle::HabitRest | Toggle::HabitArchived | Toggle::HabitWeekday(_) => {
                 if let Modal::Habit(h) = &mut self.modal {
                     match t {
@@ -42,7 +48,7 @@ impl App {
                 return;
             }
             Toggle::CalFilter(i) => {
-                self.cal_filters[i.min(3)] = on;
+                self.cal_filters[i.min(4)] = on;
                 return;
             }
         }
@@ -140,8 +146,15 @@ impl App {
             Message::SetTheme(name) => self.cfg.appearance.theme = name,
             Message::SetMode(mode) => self.cfg.appearance.mode = mode,
             Message::SetSource(source) => self.cfg.appearance.source = source,
+            Message::SetClock(clock) => self.cfg.appearance.clock = clock,
             Message::SetRadius(r) => self.cfg.appearance.radius = Some(r),
             Message::SetScale(s) => self.cfg.appearance.scale = (s * 20.0).round() / 20.0,
+            Message::SetVolume(v) => self.cfg.sounds.volume = (v * 20.0).round() / 20.0,
+            Message::TestSound => {
+                let snd = &self.cfg.sounds;
+                crate::sound::preview(crate::sound::Cue::FocusEnd, &snd.focus_end_file, snd.volume);
+                return;
+            }
             Message::SetEveryN(n) => {
                 self.cfg.timer.long_break_every = n;
                 self.timer.cfg = self.cfg.timer.to_cfg();
@@ -398,7 +411,19 @@ impl App {
                 .wrap()
                 .vertical_spacing(p.u),
             )
-            .push(switch("Compact spacing", a.compact, Toggle::Compact));
+            .push(switch("Compact spacing", a.compact, Toggle::Compact))
+            .push(labelled(
+                p,
+                "CLOCK",
+                pick_list(&Clock::ALL[..], Some(a.clock), Message::SetClock)
+                    .width(190)
+                    .text_size(13),
+            ))
+            .push(switch(
+                "Vim-style keys (h j k l, g then a letter; ? lists them)",
+                self.cfg.keys.vim,
+                Toggle::Vim,
+            ));
 
         // Colour overrides: every palette colour, editable.
         let mut grid = column![].spacing(6);
@@ -493,6 +518,52 @@ impl App {
         ]
         .spacing(p.u * 1.5);
 
+        let snd = &self.cfg.sounds;
+        let sounds = column![
+            switch("Play sounds", snd.enabled, Toggle::Sounds),
+            switch(
+                "When a focus session ends",
+                snd.focus_end,
+                Toggle::SoundFocusEnd
+            ),
+            switch("When a break ends", snd.break_end, Toggle::SoundBreakEnd),
+            switch(
+                "When a phase starts automatically",
+                snd.auto_start,
+                Toggle::SoundAutoStart
+            ),
+            switch(
+                "One minute before a phase ends",
+                snd.minute_warning,
+                Toggle::SoundWarning
+            ),
+            row![
+                labelled(
+                    p,
+                    "VOLUME",
+                    row![
+                        slider(0.0..=1.0, snd.volume, Message::SetVolume)
+                            .step(0.05_f32)
+                            .width(160),
+                        text(format!("{:.0}%", snd.volume * 100.0))
+                            .size(12)
+                            .color(p.dim)
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center)
+                ),
+                action(p, Btn::Soft, None, "Test", Message::TestSound),
+            ]
+            .spacing(p.u * 1.5)
+            .align_y(Alignment::End),
+            style::dim(
+                p,
+                "Custom sound files can be set under [sounds] in config.toml."
+            )
+            .size(11),
+        ]
+        .spacing(p.u * 1.5);
+
         let data = column![
             row![
                 field(
@@ -552,6 +623,7 @@ impl App {
             .push(section(p, "TIMER", timer))
             .push(section(p, "APPEARANCE", look))
             .push(section(p, "NOTIFICATIONS", notes))
+            .push(section(p, "SOUNDS", sounds))
             .push(section(p, "DATA", data))
             .push(section(p, "SHORTCUTS", help));
         page(p, true, "Settings", None, vscroll(p, body))

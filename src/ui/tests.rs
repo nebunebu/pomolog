@@ -295,7 +295,7 @@ fn calendar_navigation() {
     send(&mut app, Message::CalShift(-1));
     assert_eq!(app.cal_selected, app.today - Duration::days(7));
     send(&mut app, Message::Toggle(Toggle::CalFilter(3), false));
-    assert_eq!(app.cal_filters, [true, true, true, false]);
+    assert_eq!(app.cal_filters, [true, true, true, false, true]);
 }
 
 fn new_habit(app: &mut App, name: &str) -> Id {
@@ -571,7 +571,16 @@ fn command_palette() {
     assert_eq!(first(&app, "nord"), Some(Action::Theme("nord".into())));
     assert_eq!(
         first(&app, "Buy milk"),
-        Some(Action::NewCard("Buy milk".into()))
+        Some(Action::Intake("Buy milk".into()))
+    );
+    let label = |app: &App, q: &str| app.palette_actions(q).pop().map(|a| a.0);
+    assert_eq!(
+        label(&app, "Buy milk").as_deref(),
+        Some("Add Card: Buy milk")
+    );
+    assert_eq!(
+        label(&app, "Dentist tomorrow 2pm").as_deref(),
+        Some("Add Appointment: Dentist (tomorrow 2pm)")
     );
     assert!(app.palette_actions("").len() <= 9);
 
@@ -582,6 +591,263 @@ fn command_palette() {
     send(&mut app, Message::Submit(Field::PaletteQuery));
     assert!(matches!(app.modal, Modal::None));
     assert!(app.cards.iter().any(|c| c.title == "Buy milk"));
+
+    // The same box takes calendar items and notes.
+    send(
+        &mut app,
+        Message::Run(Action::Intake("Dentist tomorrow 2pm for 45m".into())),
+    );
+    let appt = app.items.iter().find(|i| i.title == "Dentist").unwrap();
+    assert_eq!(appt.date, app.today + Duration::days(1));
+    assert_eq!(appt.duration_min, Some(45));
+    send(
+        &mut app,
+        Message::Run(Action::Intake("note: gate code 4411".into())),
+    );
+    assert!(app.items.iter().any(|i| i.kind == ItemKind::Note));
+    send(
+        &mut app,
+        Message::Run(Action::Intake("Thesis due fri #writing".into())),
+    );
+    // The date and the tag are taken out of the title.
+    let card = app.cards.iter().find(|c| c.title == "Thesis").unwrap();
+    assert!(card.due.is_some() && card.tags == "writing");
+}
+
+#[test]
+fn changes_from_another_process_show_up() {
+    let dir = std::env::temp_dir().join(format!("pomolog-ui-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.join("t.db");
+    let mut app = App::build(
+        Db::open(&path).unwrap(),
+        Config::default(),
+        None,
+        SystemInput::default(),
+    );
+    assert!(!app.sync_outside(), "nothing has happened yet");
+    let today = app.today;
+    send(&mut app, Message::ItemNew(ItemKind::Note, today));
+    type_in(&mut app, Field::ItemTitle, "Mine");
+    send(&mut app, Message::ItemSave);
+    assert!(!app.sync_outside(), "its own writes are not news");
+
+    // What `pomolog event` and `pomolog add` do while the app is running.
+    let cli = Db::open(&path).unwrap();
+    let text = ItemText {
+        title: "From outside".into(),
+        date: "tomorrow".into(),
+        ..Default::default()
+    };
+    crate::cli::add_event(&cli, &text, false, today, false).unwrap();
+    crate::cli::add_card(&cli, "Card from outside", None, None, &[], now()).unwrap();
+    assert!(!app.items.iter().any(|i| i.title == "From outside"));
+    assert!(app.sync_outside());
+    assert!(app.items.iter().any(|i| i.title == "From outside"));
+    assert!(app.cards.iter().any(|c| c.title == "Card from outside"));
+    assert!(!app.sync_outside());
+    drop(cli);
+    drop(app);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn calendars_notes_and_zones() {
+    let mut app = app();
+    let today = app.today;
+    assert_eq!(app.calendars.len(), 1);
+    send(&mut app, Message::CalendarNew);
+    send(&mut app, Message::CalendarSave);
+    assert!(toast_is_error(&app), "a name is required");
+    type_in(&mut app, Field::CalendarName, "personal");
+    send(&mut app, Message::CalendarSave);
+    assert!(matches!(app.modal, Modal::Calendar(_)), "the name is taken");
+    type_in(&mut app, Field::CalendarName, "Work");
+    type_in(&mut app, Field::CalendarTz, "Narnia");
+    send(&mut app, Message::CalendarSave);
+    assert_eq!(app.calendars.len(), 1, "an unknown zone is refused");
+    type_in(&mut app, Field::CalendarTz, "eastern");
+    send(&mut app, Message::CalendarColor(Some("#4a8fe7".into())));
+    send(&mut app, Message::CalendarSave);
+    let work = app.calendars[1].clone();
+    assert_eq!(work.tz.as_deref(), Some("America/New_York"));
+    assert_eq!(work.color.as_deref(), Some("#4a8fe7"));
+
+    // An item put in that calendar takes its zone; a zone in the time wins.
+    send(&mut app, Message::ItemNew(ItemKind::Appointment, today));
+    type_in(&mut app, Field::ItemTitle, "Standup");
+    send(&mut app, Message::ItemCalendar(work.clone()));
+    type_in(&mut app, Field::ItemTime, "9:30am");
+    send(&mut app, Message::ItemSave);
+    let standup = app
+        .items
+        .iter()
+        .find(|i| i.title == "Standup")
+        .unwrap()
+        .clone();
+    assert_eq!(standup.calendar_id, work.id);
+    assert_eq!(standup.tz.as_deref(), Some("America/New_York"));
+    assert_eq!(standup.time, chrono::NaiveTime::from_hms_opt(9, 30, 0));
+    send(&mut app, Message::ItemOpen(standup.id));
+    type_in(&mut app, Field::ItemTime, "9:30 utc");
+    send(&mut app, Message::ItemSave);
+    assert_eq!(app.items[0].tz.as_deref(), Some("UTC"));
+    send(&mut app, Message::ItemOpen(standup.id));
+    type_in(&mut app, Field::ItemTz, "Mars");
+    send(&mut app, Message::ItemSave);
+    assert!(matches!(app.modal, Modal::Item(_)) && toast_is_error(&app));
+    send(&mut app, Message::CloseModal);
+
+    // A note keeps its text and has neither a time nor a zone.
+    send(&mut app, Message::ItemNew(ItemKind::Note, today));
+    type_in(&mut app, Field::ItemTitle, "Gate code");
+    type_in(&mut app, Field::ItemTime, "9:00");
+    send(
+        &mut app,
+        Message::ItemNotes(text_editor::Action::Edit(text_editor::Edit::Paste(
+            std::sync::Arc::new("4411\nask for Sam".to_string()),
+        ))),
+    );
+    send(&mut app, Message::ItemSave);
+    let note = app.items.iter().find(|i| i.kind == ItemKind::Note).unwrap();
+    assert_eq!(note.notes, "4411\nask for Sam");
+    assert_eq!((note.time, note.tz.clone()), (None, None));
+
+    // Hiding a calendar takes its items off the day; deleting removes them.
+    send(&mut app, Message::ItemNew(ItemKind::Deadline, today));
+    type_in(&mut app, Field::ItemTitle, "Ship it");
+    send(&mut app, Message::ItemCalendar(work.clone()));
+    send(&mut app, Message::ItemSave);
+    let on_day = |app: &App| -> Vec<String> {
+        app.day_items(today)
+            .iter()
+            .map(|o| o.item.title.clone())
+            .collect()
+    };
+    assert!(on_day(&app).contains(&"Ship it".to_string()));
+    send(&mut app, Message::CalendarVisible(work.id, false));
+    assert_eq!(on_day(&app), ["Gate code"]);
+    assert!(
+        !app.db.calendars().unwrap()[1].visible,
+        "and it is remembered"
+    );
+    send(&mut app, Message::CalendarVisible(work.id, true));
+    send(&mut app, Message::CalendarOpen(work.id));
+    send(
+        &mut app,
+        Message::Ask(ConfirmAction::DeleteCalendar(work.id)),
+    );
+    send(&mut app, Message::ConfirmYes);
+    assert_eq!(app.calendars.len(), 1);
+    assert!(app.items.iter().all(|i| i.calendar_id == DEFAULT_CALENDAR));
+    assert_eq!(app.items.len(), 1);
+
+    send(&mut app, Message::SetClock(crate::config::Clock::H12));
+    let t = chrono::NaiveTime::from_hms_opt(21, 0, 0).unwrap();
+    assert_eq!(app.time_text(t), "9:00 PM");
+}
+
+#[test]
+fn vim_keys() {
+    let mut app = app();
+    let press = |app: &mut App, k: &str| {
+        let (key, mods) = match k {
+            "enter" => (Key::Named(Named::Enter), Modifiers::empty()),
+            k if k.len() == 1 && k.chars().all(|c| c.is_ascii_uppercase()) => {
+                (Key::Character(k.into()), Modifiers::SHIFT)
+            }
+            k => (Key::Character(k.into()), Modifiers::empty()),
+        };
+        send(app, Message::Key(key, mods, false));
+    };
+    // g then a letter goes to a view; a lone letter after that is not a chord.
+    press(&mut app, "g");
+    press(&mut app, "c");
+    assert_eq!(app.view, View::Calendar);
+    let today = app.today;
+    press(&mut app, "l");
+    press(&mut app, "j");
+    assert_eq!(app.cal_selected, today + Duration::days(8));
+    assert_eq!(app.cal_month, dates::month_start(app.cal_selected));
+    press(&mut app, "k");
+    press(&mut app, "h");
+    assert_eq!(app.cal_selected, today);
+    press(&mut app, "w");
+    assert!(app.cal_week);
+    press(&mut app, "m");
+    press(&mut app, "L");
+    assert_eq!(
+        app.cal_month,
+        dates::add_months(dates::month_start(today), 1)
+    );
+    press(&mut app, "t");
+    press(&mut app, "n");
+    assert!(matches!(&app.modal, Modal::Item(i) if i.kind == ItemKind::Note));
+    press(&mut app, "j");
+    assert_eq!(app.cal_selected, today, "keys do nothing behind a dialog");
+    type_in(&mut app, Field::ItemTitle, "Remember");
+    send(&mut app, Message::ItemSave);
+    press(&mut app, "enter");
+    assert!(matches!(&app.modal, Modal::Item(i) if i.title == "Remember"));
+    send(&mut app, Message::CloseModal);
+    // A letter typed into a field is just a letter.
+    send(
+        &mut app,
+        Message::Key(Key::Character("l".into()), Modifiers::empty(), true),
+    );
+    assert_eq!(app.cal_selected, today);
+
+    // Board: move between lists and cards, and move the card itself.
+    let a = add_card(&mut app, ListKind::Normal, "a");
+    let b = add_card(&mut app, ListKind::Normal, "b");
+    let c = add_card(&mut app, ListKind::Progress, "c");
+    press(&mut app, "g");
+    press(&mut app, "b");
+    assert_eq!(app.view, View::Board);
+    press(&mut app, "j");
+    assert_eq!(app.board_sel, Some(a));
+    press(&mut app, "j");
+    press(&mut app, "j");
+    assert_eq!(app.board_sel, Some(b), "stops at the last card");
+    press(&mut app, "K");
+    assert_eq!(titles_in(&app, list(&app, ListKind::Normal)), ["b", "a"]);
+    press(&mut app, "l");
+    assert_eq!(app.board_sel, Some(c));
+    press(&mut app, "l");
+    assert_eq!(app.board_sel, None, "the Done list is empty");
+    press(&mut app, "h");
+    press(&mut app, "L");
+    assert_eq!(titles_in(&app, list(&app, ListKind::Done)), ["c"]);
+    assert!(app.db.card(c).unwrap().unwrap().completed_at.is_some());
+    press(&mut app, "enter");
+    assert!(matches!(&app.modal, Modal::Card(e) if e.id == c));
+    send(&mut app, Message::CloseModal);
+    press(&mut app, "o");
+    assert_eq!(app.adding_to, Some(list(&app, ListKind::Done)));
+    app.adding_to = None;
+
+    // Habits.
+    let read = new_habit(&mut app, "Read");
+    press(&mut app, "g");
+    press(&mut app, "h");
+    press(&mut app, "j");
+    assert_eq!(app.habit_sel, Some(read));
+    press(&mut app, "x");
+    assert_eq!(app.stored_entry(read, today).value, 1.0);
+    press(&mut app, "x");
+    assert_eq!(app.stored_entry(read, today).value, 0.0);
+
+    // Palette, help, and the switch in the settings.
+    press(&mut app, ":");
+    assert!(matches!(app.modal, Modal::Palette { .. }));
+    send(&mut app, Message::CloseModal);
+    press(&mut app, "?");
+    assert!(matches!(app.modal, Modal::Keys));
+    send(&mut app, Message::CloseModal);
+    send(&mut app, Message::Toggle(Toggle::Vim, false));
+    press(&mut app, "g");
+    press(&mut app, "t");
+    assert_eq!(app.view, View::Habits, "switched off");
 }
 
 #[test]
@@ -789,6 +1055,27 @@ fn every_view_and_dialog_builds() {
     let _ = app.view(w);
     app.modal = Modal::Palette { query: "e".into() };
     let _ = app.view(w);
+    app.modal = Modal::Keys;
+    let _ = app.view(w);
+    send(&mut app, Message::CalendarNew);
+    type_in(&mut app, Field::CalendarName, "Work");
+    type_in(&mut app, Field::CalendarTz, "Eastern");
+    let _ = app.view(w);
+    send(&mut app, Message::CalendarSave);
+    let work = app.calendars[1].clone();
+    send(&mut app, Message::CalendarOpen(work.id));
+    let _ = app.view(w);
+    // A zoned item in a coloured calendar, on a twelve-hour clock.
+    send(&mut app, Message::ItemNew(ItemKind::Appointment, today));
+    type_in(&mut app, Field::ItemTitle, "Zoned");
+    type_in(&mut app, Field::ItemTime, "9pm Pacific");
+    send(&mut app, Message::ItemCalendar(work));
+    let _ = app.view(w);
+    send(&mut app, Message::ItemSave);
+    send(&mut app, Message::SetClock(crate::config::Clock::H12));
+    app.board_sel = Some(card);
+    app.habit_sel = Some(read);
+    all_views(&mut app);
     app.modal = Modal::None;
 
     // A drag in progress and a toast.

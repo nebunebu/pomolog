@@ -4,9 +4,9 @@ use super::app::{App, Choice, El, Field, Message, View};
 use super::shell::{action, dots, empty, field, icon_btn, meter, page, section, vscroll};
 use super::style::{self, Btn, P, alpha, btn, chip, icon};
 use super::widgets::Ring;
+use crate::core::dates;
 use crate::core::habits::{self, DayState};
 use crate::core::model::*;
-use crate::core::{dates, recur};
 use iced::widget::{
     Space, button, canvas, center, column, container, pick_list, row, space, stack, text,
 };
@@ -352,9 +352,9 @@ impl App {
         // ---- schedule ----
         let mut schedule = column![].spacing(6);
         let mut any = false;
-        for i in recur::on_day(&self.items, today) {
+        for o in self.day_items(today) {
             any = true;
-            schedule = schedule.push(self.item_row(p, i, today));
+            schedule = schedule.push(self.item_row(p, o.item, today, o.time));
         }
         for (c, board, done) in &self.due_cards {
             let Some(due) = c.due else { continue };
@@ -390,10 +390,14 @@ impl App {
         }
         // Overdue standalone deadlines.
         for i in self.items.iter().filter(|i| {
-            i.kind == ItemKind::Deadline && !i.done && i.recur == Recur::None && i.date < today
+            i.kind == ItemKind::Deadline
+                && !i.done
+                && i.recur == Recur::None
+                && i.date < today
+                && !self.hidden.contains(&i.calendar_id)
         }) {
             any = true;
-            schedule = schedule.push(self.item_row(p, i, i.date));
+            schedule = schedule.push(self.item_row(p, i, i.date, i.time));
         }
         if !any {
             schedule = schedule.push(empty(p, "Nothing scheduled or due today."));

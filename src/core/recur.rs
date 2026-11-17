@@ -1,7 +1,8 @@
 //! Recurrence of calendar items.
 
 use super::model::{Item, ItemKind, Recur};
-use chrono::{Datelike, NaiveDate};
+use super::tz;
+use chrono::{Datelike, Duration, Local, NaiveDate, NaiveTime, TimeZone};
 use std::collections::HashSet;
 
 pub fn occurs_on(item: &Item, d: NaiveDate) -> bool {
@@ -22,10 +23,56 @@ pub fn occurs_on(item: &Item, d: NaiveDate) -> bool {
     }
 }
 
-/// Items occurring on `d`, timed ones first in time order.
-pub fn on_day(items: &[Item], d: NaiveDate) -> Vec<&Item> {
-    let mut v: Vec<&Item> = items.iter().filter(|i| occurs_on(i, d)).collect();
-    v.sort_by_key(|i| (i.kind != ItemKind::Holiday, i.time.is_none(), i.time, i.id));
+/// An item as it falls on one local day.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Occ<'a> {
+    pub item: &'a Item,
+    /// Local time of day, converted from the item's zone if it has one.
+    pub time: Option<NaiveTime>,
+}
+
+/// Items occurring on the local day `d`: holidays, then timed ones in time
+/// order, then the rest.
+pub fn occurrences_on(items: &[Item], d: NaiveDate) -> Vec<Occ<'_>> {
+    occurrences_in(items, d, &Local)
+}
+
+/// As `occurrences_on`, with "local" being `zone`. A timed item written in
+/// another zone can land on the day before or after its own date.
+pub fn occurrences_in<'a, Z: TimeZone>(items: &'a [Item], d: NaiveDate, zone: &Z) -> Vec<Occ<'a>> {
+    let mut v: Vec<Occ> = Vec::new();
+    for item in items {
+        match (item.time, item.tz.as_deref()) {
+            (Some(t), Some(z)) => {
+                for shift in -1..=1 {
+                    let there = d + Duration::days(shift);
+                    if !occurs_on(item, there) {
+                        continue;
+                    }
+                    let here = tz::convert(there.and_time(t), z, zone);
+                    if here.date() == d {
+                        v.push(Occ {
+                            item,
+                            time: Some(here.time()),
+                        });
+                    }
+                }
+            }
+            _ if occurs_on(item, d) => v.push(Occ {
+                item,
+                time: item.time,
+            }),
+            _ => {}
+        }
+    }
+    v.sort_by_key(|o| {
+        (
+            o.item.kind != ItemKind::Holiday,
+            o.time.is_none(),
+            o.time,
+            o.item.id,
+        )
+    });
     v
 }
 
@@ -95,6 +142,38 @@ mod tests {
         let i = item(Recur::Yearly, d(2024, 2, 29));
         assert!(occurs_on(&i, d(2028, 2, 29)));
         assert!(!occurs_on(&i, d(2027, 2, 28)));
+    }
+
+    #[test]
+    fn zoned_items_land_on_the_local_day() {
+        let berlin = chrono_tz::Europe::Berlin;
+        // Monday 9 PM Eastern, weekly: Tuesday 3 AM in Berlin.
+        let mut club = item(Recur::Weekly, d(2026, 11, 16));
+        club.time = NaiveTime::from_hms_opt(21, 0, 0);
+        club.tz = Some("America/New_York".into());
+        let mut plain = item(Recur::None, d(2026, 11, 17));
+        plain.id = 2;
+        let mut early = item(Recur::None, d(2026, 11, 17));
+        early.time = NaiveTime::from_hms_opt(1, 0, 0);
+        early.id = 3;
+        let items = [club, plain, early];
+
+        assert!(occurrences_in(&items, d(2026, 11, 16), &berlin).is_empty());
+        let tue = occurrences_in(&items, d(2026, 11, 17), &berlin);
+        let got: Vec<_> = tue.iter().map(|o| (o.item.id, o.time)).collect();
+        assert_eq!(
+            got,
+            [
+                (3, NaiveTime::from_hms_opt(1, 0, 0)),
+                (0, NaiveTime::from_hms_opt(3, 0, 0)),
+                (2, None)
+            ],
+            "sorted by local time, untimed last"
+        );
+        assert_eq!(occurrences_in(&items, d(2026, 11, 24), &berlin).len(), 1);
+        // In its own zone it stays on Monday.
+        let ny = chrono_tz::America::New_York;
+        assert_eq!(occurrences_in(&items, d(2026, 11, 16), &ny).len(), 1);
     }
 
     #[test]

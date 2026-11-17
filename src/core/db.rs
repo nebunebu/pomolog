@@ -6,7 +6,10 @@ use std::path::Path;
 
 pub type Result<T> = rusqlite::Result<T>;
 
-const MIGRATIONS: &[&str] = &[include_str!("migrations/0001_init.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("migrations/0001_init.sql"),
+    include_str!("migrations/0002_calendars.sql"),
+];
 
 pub struct Db {
     pub conn: Connection,
@@ -33,9 +36,17 @@ impl Db {
     }
 
     fn migrate(&mut self) -> Result<()> {
-        let version = self.schema_version()?;
-        for (i, sql) in MIGRATIONS.iter().enumerate().skip(version) {
-            let tx = self.conn.transaction()?;
+        for (i, sql) in MIGRATIONS.iter().enumerate() {
+            // The app and the command line may both open a database that
+            // needs migrating. Take the write lock first, then look at the
+            // version, so only one of them runs each step.
+            let tx = self
+                .conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let version: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+            if version as usize > i {
+                continue;
+            }
             tx.execute_batch(sql)?;
             tx.pragma_update(None, "user_version", i as i64 + 1)?;
             tx.commit()?;
@@ -414,37 +425,141 @@ impl Db {
         .collect()
     }
 
-    // ---- calendar items ----
+    /// Changes each time another connection commits to the database, so a
+    /// running app can tell that the command line wrote something.
+    pub fn data_version(&self) -> Result<i64> {
+        self.conn.query_row("PRAGMA data_version", [], |r| r.get(0))
+    }
 
-    pub fn items(&self) -> Result<Vec<Item>> {
-        let mut st = self.conn.prepare(
-            "SELECT id,kind,title,date,time,duration_min,recur,recur_until,done,source,notes
-             FROM items ORDER BY date,time,id",
-        )?;
+    // ---- calendars ----
+
+    pub fn calendars(&self) -> Result<Vec<Calendar>> {
+        let mut st = self
+            .conn
+            .prepare("SELECT id,name,color,tz,visible FROM calendars ORDER BY position,id")?;
         st.query_map([], |r| {
-            Ok(Item {
+            Ok(Calendar {
                 id: r.get(0)?,
-                kind: ItemKind::parse(&r.get::<_, String>(1)?),
-                title: r.get(2)?,
-                date: r.get(3)?,
-                time: r.get(4)?,
-                duration_min: r.get(5)?,
-                recur: Recur::parse(&r.get::<_, String>(6)?),
-                recur_until: r.get(7)?,
-                done: r.get(8)?,
-                source: r.get(9)?,
-                notes: r.get(10)?,
+                name: r.get(1)?,
+                color: r.get(2)?,
+                tz: r.get(3)?,
+                visible: r.get(4)?,
             })
         })?
         .collect()
     }
 
     /// Inserts when `id` is 0, otherwise updates. Returns the id.
+    pub fn save_calendar(&self, c: &Calendar) -> Result<Id> {
+        if c.id == 0 {
+            self.conn.execute(
+                "INSERT INTO calendars(name,color,tz,visible,position)
+                 VALUES(?1,?2,?3,?4,(SELECT COALESCE(MAX(position),0)+1 FROM calendars))",
+                params![c.name, c.color, c.tz, c.visible],
+            )?;
+            Ok(self.conn.last_insert_rowid())
+        } else {
+            self.conn.execute(
+                "UPDATE calendars SET name=?2,color=?3,tz=?4,visible=?5 WHERE id=?1",
+                params![c.id, c.name, c.color, c.tz, c.visible],
+            )?;
+            Ok(c.id)
+        }
+    }
+
+    /// Deletes a calendar and its items. The default calendar stays; returns
+    /// false for it.
+    pub fn delete_calendar(&mut self, id: Id) -> Result<bool> {
+        if id == DEFAULT_CALENDAR {
+            return Ok(false);
+        }
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM items WHERE calendar_id=?1", [id])?;
+        let n = tx.execute("DELETE FROM calendars WHERE id=?1", [id])?;
+        tx.commit()?;
+        Ok(n > 0)
+    }
+
+    // ---- calendar items ----
+
+    const ITEM_COLS: &'static str =
+        "id,kind,title,date,time,duration_min,recur,recur_until,done,source,notes,calendar_id,tz";
+
+    fn item_from(r: &Row) -> Result<Item> {
+        Ok(Item {
+            id: r.get(0)?,
+            kind: ItemKind::parse(&r.get::<_, String>(1)?),
+            title: r.get(2)?,
+            date: r.get(3)?,
+            time: r.get(4)?,
+            duration_min: r.get(5)?,
+            recur: Recur::parse(&r.get::<_, String>(6)?),
+            recur_until: r.get(7)?,
+            done: r.get(8)?,
+            source: r.get(9)?,
+            notes: r.get(10)?,
+            calendar_id: r.get(11)?,
+            tz: r.get(12)?,
+        })
+    }
+
+    pub fn items(&self) -> Result<Vec<Item>> {
+        let mut st = self.conn.prepare(&format!(
+            "SELECT {} FROM items ORDER BY date,time,id",
+            Self::ITEM_COLS
+        ))?;
+        st.query_map([], Self::item_from)?.collect()
+    }
+
+    pub fn item(&self, id: Id) -> Result<Option<Item>> {
+        self.conn
+            .query_row(
+                &format!("SELECT {} FROM items WHERE id=?1", Self::ITEM_COLS),
+                [id],
+                Self::item_from,
+            )
+            .optional()
+    }
+
+    pub fn item_by_source(&self, source: &str) -> Result<Option<Item>> {
+        self.conn
+            .query_row(
+                &format!(
+                    "SELECT {} FROM items WHERE source=?1 ORDER BY id LIMIT 1",
+                    Self::ITEM_COLS
+                ),
+                [source],
+                Self::item_from,
+            )
+            .optional()
+    }
+
+    /// Another item in the same calendar with the same kind, title, date and
+    /// time: what adding the same thing twice would produce.
+    pub fn find_duplicate(&self, i: &Item) -> Result<Option<Id>> {
+        self.conn
+            .query_row(
+                "SELECT id FROM items WHERE calendar_id=?1 AND kind=?2 AND title=?3 COLLATE NOCASE
+                 AND date=?4 AND time IS ?5 AND id<>?6 ORDER BY id LIMIT 1",
+                params![
+                    i.calendar_id,
+                    i.kind.as_str(),
+                    i.title,
+                    i.date,
+                    i.time,
+                    i.id
+                ],
+                |r| r.get(0),
+            )
+            .optional()
+    }
+
+    /// Inserts when `id` is 0, otherwise updates. Returns the id.
     pub fn save_item(&self, i: &Item) -> Result<Id> {
         if i.id == 0 {
             self.conn.execute(
-                "INSERT INTO items(kind,title,date,time,duration_min,recur,recur_until,done,source,notes)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                "INSERT INTO items(kind,title,date,time,duration_min,recur,recur_until,done,source,
+                 notes,calendar_id,tz) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
                 params![
                     i.kind.as_str(),
                     i.title,
@@ -455,14 +570,16 @@ impl Db {
                     i.recur_until,
                     i.done,
                     i.source,
-                    i.notes
+                    i.notes,
+                    i.calendar_id,
+                    i.tz
                 ],
             )?;
             Ok(self.conn.last_insert_rowid())
         } else {
             self.conn.execute(
                 "UPDATE items SET kind=?2,title=?3,date=?4,time=?5,duration_min=?6,recur=?7,
-                 recur_until=?8,done=?9,source=?10,notes=?11 WHERE id=?1",
+                 recur_until=?8,done=?9,source=?10,notes=?11,calendar_id=?12,tz=?13 WHERE id=?1",
                 params![
                     i.id,
                     i.kind.as_str(),
@@ -474,16 +591,19 @@ impl Db {
                     i.recur_until,
                     i.done,
                     i.source,
-                    i.notes
+                    i.notes,
+                    i.calendar_id,
+                    i.tz
                 ],
             )?;
             Ok(i.id)
         }
     }
 
-    pub fn delete_item(&self, id: Id) -> Result<()> {
-        self.conn.execute("DELETE FROM items WHERE id=?1", [id])?;
-        Ok(())
+    /// Returns whether there was such an item.
+    pub fn delete_item(&self, id: Id) -> Result<bool> {
+        let n = self.conn.execute("DELETE FROM items WHERE id=?1", [id])?;
+        Ok(n > 0)
     }
 
     pub fn item_source_exists(&self, source: &str) -> Result<bool> {
@@ -772,5 +892,110 @@ mod tests {
         db.set_habit_entry(h.id, now().date(), HabitEntry::default())
             .unwrap();
         assert!(!db.habit_entries().unwrap().contains_key(&h.id));
+    }
+
+    #[test]
+    fn version_one_database_gains_the_default_calendar() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(MIGRATIONS[0]).unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        conn.execute(
+            "INSERT INTO items(kind,title,date) VALUES('appointment','Old','2026-11-16')",
+            [],
+        )
+        .unwrap();
+        let db = Db::init(conn).unwrap();
+        assert_eq!(db.schema_version().unwrap(), MIGRATIONS.len());
+        let cals = db.calendars().unwrap();
+        assert_eq!(cals.len(), 1);
+        assert_eq!(
+            (cals[0].id, cals[0].name.as_str()),
+            (DEFAULT_CALENDAR, "Personal")
+        );
+        let items = db.items().unwrap();
+        assert_eq!(
+            (items[0].calendar_id, items[0].tz.clone()),
+            (DEFAULT_CALENDAR, None)
+        );
+        // What a build from before the migration still writes.
+        db.conn
+            .execute(
+                "INSERT INTO items(kind,title,date) VALUES('deadline','Older app','2026-11-17')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(db.items().unwrap()[1].calendar_id, DEFAULT_CALENDAR);
+    }
+
+    #[test]
+    fn calendars_duplicates_and_sources() {
+        let mut db = Db::open_in_memory().unwrap();
+        let mut work = Calendar::new("Work");
+        work.tz = Some("America/New_York".into());
+        work.id = db.save_calendar(&work).unwrap();
+        work.visible = false;
+        db.save_calendar(&work).unwrap();
+        assert_eq!(db.calendars().unwrap()[1], work);
+
+        let mut it = Item::new(ItemKind::Appointment, "Standup", now().date());
+        it.calendar_id = work.id;
+        it.source = Some("cli:standup".into());
+        assert_eq!(db.find_duplicate(&it).unwrap(), None);
+        it.id = db.save_item(&it).unwrap();
+        assert_eq!(
+            db.find_duplicate(&it).unwrap(),
+            None,
+            "not its own duplicate"
+        );
+        let mut again = Item::new(ItemKind::Appointment, "standup", now().date());
+        again.calendar_id = work.id;
+        assert_eq!(db.find_duplicate(&again).unwrap(), Some(it.id));
+        again.calendar_id = DEFAULT_CALENDAR;
+        assert_eq!(db.find_duplicate(&again).unwrap(), None, "another calendar");
+        assert_eq!(db.item_by_source("cli:standup").unwrap(), Some(it.clone()));
+        assert_eq!(db.item(it.id).unwrap(), Some(it.clone()));
+
+        assert!(!db.delete_calendar(DEFAULT_CALENDAR).unwrap());
+        assert!(db.delete_calendar(work.id).unwrap());
+        assert!(db.items().unwrap().is_empty(), "its items go with it");
+        assert!(!db.delete_item(it.id).unwrap());
+    }
+
+    #[test]
+    fn opening_at_the_same_time_migrates_once() {
+        let dir = std::env::temp_dir().join(format!("pomolog-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("t.db");
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let path = path.clone();
+                std::thread::spawn(move || Db::open(&path).map(|db| db.schema_version()))
+            })
+            .collect();
+        for h in handles {
+            let version = h.join().unwrap().expect("opens").unwrap();
+            assert_eq!(version, MIGRATIONS.len());
+        }
+        assert_eq!(Db::open(&path).unwrap().calendars().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn data_version_moves_when_another_connection_writes() {
+        let dir = std::env::temp_dir().join(format!("pomolog-dv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("t.db");
+        let a = Db::open(&path).unwrap();
+        let before = a.data_version().unwrap();
+        a.save_item(&Item::new(ItemKind::Note, "mine", now().date()))
+            .unwrap();
+        assert_eq!(a.data_version().unwrap(), before, "own writes do not count");
+        let b = Db::open(&path).unwrap();
+        b.save_item(&Item::new(ItemKind::Note, "theirs", now().date()))
+            .unwrap();
+        assert_ne!(a.data_version().unwrap(), before);
+        assert_eq!(a.items().unwrap().len(), 2);
+        drop((a, b));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

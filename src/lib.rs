@@ -1,8 +1,10 @@
 pub mod bridge;
+pub mod cli;
 pub mod config;
 pub mod core;
 pub mod ipc;
 pub mod notify;
+pub mod sound;
 pub mod theme;
 pub mod tray;
 pub mod ui;

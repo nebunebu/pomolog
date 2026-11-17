@@ -18,6 +18,7 @@
           libxkbcommon
           vulkan-loader
           libGL
+          alsa-lib
         ];
 
       mkPomolog =
@@ -62,7 +63,7 @@
 
           meta = {
             description = "Pomodoro timer with kanban, calendar, habits and analytics";
-            license = pkgs.lib.licenses.gpl3Plus;
+            license = pkgs.lib.licenses.mit;
             mainProgram = "pomolog";
             platforms = pkgs.lib.platforms.linux;
           };

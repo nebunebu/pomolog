@@ -6,6 +6,7 @@ use crate::bridge::{self, Command, Status};
 use crate::config::{self, Config};
 use crate::core::db::Db;
 use crate::core::habits::{self, Ctx, DayState, Streak};
+use crate::core::intake::{self, Added, Intake};
 use crate::core::model::*;
 use crate::core::stats;
 use crate::core::timer::{Effect, Timer};
@@ -97,7 +98,9 @@ pub enum Field {
     ItemTime,
     ItemDuration,
     ItemUntil,
-    ItemNotes,
+    ItemTz,
+    CalendarName,
+    CalendarTz,
     HabitName,
     HabitTarget,
     HabitUnit,
@@ -127,6 +130,12 @@ pub enum Toggle {
     Compact,
     Notifications,
     DailySummary,
+    Sounds,
+    SoundFocusEnd,
+    SoundBreakEnd,
+    SoundAutoStart,
+    SoundWarning,
+    Vim,
     HabitRest,
     HabitArchived,
     ItemDone,
@@ -149,6 +158,7 @@ pub enum ConfirmAction {
     DeleteList(Id),
     DeleteHabit(Id),
     DeleteCard(Id),
+    DeleteCalendar(Id),
     ImportData,
     WipeData,
 }
@@ -228,7 +238,6 @@ pub struct CardEdit {
     pub lists: Vec<Choice>,
 }
 
-#[derive(Debug, Clone)]
 pub struct ItemEdit {
     pub id: Id,
     pub kind: ItemKind,
@@ -238,9 +247,20 @@ pub struct ItemEdit {
     pub duration: String,
     pub recur: Recur,
     pub until: String,
-    pub notes: String,
+    pub notes: text_editor::Content,
     pub done: bool,
     pub source: Option<String>,
+    pub calendar: Id,
+    /// Zone the time is written in; empty for local time.
+    pub tz: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct CalendarEdit {
+    pub id: Id,
+    pub name: String,
+    pub color: Option<String>,
+    pub tz: String,
 }
 
 #[derive(Debug, Clone)]
@@ -278,6 +298,9 @@ pub enum Modal {
     Palette {
         query: String,
     },
+    Calendar(CalendarEdit),
+    /// The list of keyboard shortcuts.
+    Keys,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -298,7 +321,8 @@ pub enum Action {
     TimerSkip,
     Zen,
     StartCard(Id),
-    NewCard(String),
+    /// Free text for the intake: a card, an appointment, a deadline or a note.
+    Intake(String),
     Theme(String),
 }
 
@@ -359,6 +383,14 @@ pub enum Message {
     ItemDone(Id, bool),
     IcsKind(ItemKind),
     IcsImport,
+    IcsCalendar(Calendar),
+    ItemCalendar(Calendar),
+    ItemNotes(text_editor::Action),
+    CalendarNew,
+    CalendarOpen(Id),
+    CalendarColor(Option<String>),
+    CalendarSave,
+    CalendarVisible(Id, bool),
 
     // Habits
     HabitNew,
@@ -378,8 +410,11 @@ pub enum Message {
     SetTheme(String),
     SetMode(config::Mode),
     SetSource(config::Source),
+    SetClock(config::Clock),
     SetRadius(f32),
     SetScale(f32),
+    SetVolume(f32),
+    TestSound,
     SetEveryN(u32),
     OverrideClear(&'static str),
     ThemeSaveAs,
@@ -447,6 +482,8 @@ pub struct App {
     pub reason: String,
     pub manual_min: String,
     notified: HashSet<String>,
+    /// The one-minute warning already sounded for the running phase.
+    minute_warned: bool,
 
     // Data, reloaded after changes.
     pub boards: Vec<Board>,
@@ -455,6 +492,12 @@ pub struct App {
     pub cards: Vec<Card>,
     pub in_progress: Vec<(Card, String)>,
     pub items: Vec<Item>,
+    pub calendars: Vec<Calendar>,
+    /// Calendars switched off in the calendar view.
+    pub hidden: HashSet<Id>,
+    /// `PRAGMA data_version` when the data was last loaded.
+    data_version: i64,
+    last_data_check: Instant,
     pub due_cards: Vec<(Card, String, bool)>,
     pub holidays: HashSet<NaiveDate>,
     pub habits: Vec<Habit>,
@@ -473,15 +516,22 @@ pub struct App {
     pub cal_month: NaiveDate,
     pub cal_week: bool,
     pub cal_selected: NaiveDate,
-    pub cal_filters: [bool; 4],
+    pub cal_filters: [bool; 5],
     pub ics_path: String,
     pub ics_kind: ItemKind,
+    pub ics_calendar: Id,
+    /// Keyboard selection on the board: a card, and the list it is in.
+    pub board_sel: Option<Id>,
+    pub board_list: usize,
+    pub habit_sel: Option<Id>,
+    /// A `g` was pressed and the next key picks a view.
+    pub(super) pending_g: bool,
     pub habit_qty: HashMap<Id, String>,
     pub ana: Analytics,
     pub set: SettingsUi,
 }
 
-fn now() -> NaiveDateTime {
+pub(super) fn now() -> NaiveDateTime {
     Local::now().naive_local()
 }
 
@@ -560,12 +610,17 @@ impl App {
             reason: String::new(),
             manual_min: String::new(),
             notified: HashSet::new(),
+            minute_warned: false,
             boards: Vec::new(),
             board_id: None,
             lists: Vec::new(),
             cards: Vec::new(),
             in_progress: Vec::new(),
             items: Vec::new(),
+            calendars: Vec::new(),
+            hidden: HashSet::new(),
+            data_version: 0,
+            last_data_check: Instant::now(),
             due_cards: Vec::new(),
             holidays: HashSet::new(),
             habits: Vec::new(),
@@ -581,9 +636,14 @@ impl App {
             cal_month: dates::month_start(today),
             cal_week: false,
             cal_selected: today,
-            cal_filters: [true; 4],
+            cal_filters: [true; 5],
             ics_path: String::new(),
             ics_kind: ItemKind::Holiday,
+            ics_calendar: DEFAULT_CALENDAR,
+            board_sel: None,
+            board_list: 0,
+            habit_sel: None,
+            pending_g: false,
             habit_qty: HashMap::new(),
             ana: Analytics {
                 range: Range::Week,
@@ -613,6 +673,7 @@ impl App {
         app.board_id = app.db.meta("board").and_then(|v| v.parse().ok());
         app.sync_settings_ui();
         app.reload_all();
+        app.data_version = app.db.data_version().unwrap_or(0);
         app
     }
 
@@ -823,8 +884,44 @@ impl App {
         }
     }
 
+    /// Reloads everything if another process (the command line, usually)
+    /// has written to the database since the last look. Returns whether it
+    /// had.
+    pub fn sync_outside(&mut self) -> bool {
+        match self.db.data_version() {
+            Ok(v) if v != self.data_version => {
+                self.data_version = v;
+                self.reload_all();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// A time of day the way the settings ask for it.
+    pub fn time_text(&self, t: chrono::NaiveTime) -> String {
+        dates::fmt_time(t, self.cfg.appearance.clock == config::Clock::H12)
+    }
+
+    /// What is on a local day, leaving out calendars that are switched off.
+    pub fn day_items(&self, d: NaiveDate) -> Vec<recur::Occ<'_>> {
+        let mut v = recur::occurrences_on(&self.items, d);
+        v.retain(|o| !self.hidden.contains(&o.item.calendar_id));
+        v
+    }
+
     pub fn reload_calendar(&mut self) {
         self.items = self.db.items().unwrap_or_default();
+        self.calendars = self.db.calendars().unwrap_or_default();
+        self.hidden = self
+            .calendars
+            .iter()
+            .filter(|c| !c.visible)
+            .map(|c| c.id)
+            .collect();
+        if !self.calendars.iter().any(|c| c.id == self.ics_calendar) {
+            self.ics_calendar = DEFAULT_CALENDAR;
+        }
         self.holidays = recur::holidays_between(
             &self.items,
             self.today - Duration::days(800),
@@ -962,6 +1059,7 @@ impl App {
 
     pub fn apply(&mut self, effects: Vec<Effect>) {
         let mut logged = false;
+        let mut ended = false;
         for e in effects {
             match e {
                 Effect::Log(r) => {
@@ -971,6 +1069,14 @@ impl App {
                 }
                 Effect::Ended { phase, completed } => {
                     self.reason.clear();
+                    ended = true;
+                    if completed && self.live {
+                        let cue = match phase {
+                            Phase::Focus => crate::sound::Cue::FocusEnd,
+                            _ => crate::sound::Cue::BreakEnd,
+                        };
+                        crate::sound::play(cue, &self.cfg.sounds);
+                    }
                     if completed && self.live && self.cfg.notifications.enabled {
                         let (title, body) = match phase {
                             Phase::Focus => ("Focus session complete", "Time for a break."),
@@ -979,7 +1085,15 @@ impl App {
                         crate::notify::send(title, body);
                     }
                 }
-                Effect::Started(_) => self.reason.clear(),
+                Effect::Started(_) => {
+                    self.reason.clear();
+                    self.minute_warned = false;
+                    // Started right after an end in the same batch means
+                    // auto-start; a manual start comes on its own.
+                    if ended && self.live {
+                        crate::sound::play(crate::sound::Cue::AutoStart, &self.cfg.sounds);
+                    }
+                }
             }
         }
         if logged {
@@ -988,6 +1102,21 @@ impl App {
             self.reload_sessions();
         }
         self.publish_status();
+    }
+
+    /// Sounds once when a timed phase reaches its last minute. Phases of 90
+    /// seconds or less are too short for a warning to be useful.
+    fn minute_warning(&mut self) {
+        let Some(a) = &self.timer.active else { return };
+        if self.minute_warned || a.paused || a.open_ended || a.planned_s <= 90 {
+            return;
+        }
+        if a.remaining_s() <= 60 {
+            self.minute_warned = true;
+            if self.live {
+                crate::sound::play(crate::sound::Cue::Warning, &self.cfg.sounds);
+            }
+        }
     }
 
     fn publish_status(&mut self) {
@@ -1049,12 +1178,13 @@ impl App {
         let today_s = today.to_string();
         if n.daily_summary && self.db.meta("summary_date").as_deref() != Some(&today_s) {
             let _ = self.db.set_meta("summary_date", &today_s);
-            let mut lines: Vec<String> = recur::on_day(&self.items, today)
+            let mut lines: Vec<String> = self
+                .day_items(today)
                 .into_iter()
-                .filter(|i| !(i.kind == ItemKind::Deadline && i.done))
-                .map(|i| match i.time {
-                    Some(t) => format!("{} {}", t.format("%H:%M"), i.title),
-                    None => i.title.clone(),
+                .filter(|o| !(o.item.kind == ItemKind::Deadline && o.item.done))
+                .map(|o| match o.time {
+                    Some(t) => format!("{} {}", self.time_text(t), o.item.title),
+                    None => o.item.title.clone(),
                 })
                 .collect();
             lines.extend(
@@ -1069,15 +1199,16 @@ impl App {
         }
         if n.appointment_lead_min > 0 {
             let lead = Duration::minutes(n.appointment_lead_min as i64);
-            let due: Vec<(String, String)> = recur::on_day(&self.items, today)
+            let due: Vec<(String, String)> = self
+                .day_items(today)
                 .into_iter()
-                .filter(|i| i.kind == ItemKind::Appointment)
-                .filter_map(|i| {
-                    let at = today.and_time(i.time?);
+                .filter(|o| o.item.kind == ItemKind::Appointment)
+                .filter_map(|o| {
+                    let at = today.and_time(o.time?);
                     (self.now >= at - lead && self.now < at).then(|| {
                         (
-                            format!("appt:{}:{today}", i.id),
-                            format!("{} at {}", i.title, at.format("%H:%M")),
+                            format!("appt:{}:{today}", o.item.id),
+                            format!("{} at {}", o.item.title, self.time_text(at.time())),
                         )
                     })
                 })
@@ -1155,6 +1286,7 @@ impl App {
             Command::Add { title, due, board } => {
                 self.quick_add(&title, due.as_deref(), board.as_deref())
             }
+            Command::Event(text) => self.add_item_text(&text),
         }
         Task::none()
     }
@@ -1174,6 +1306,49 @@ impl App {
         }
         crate::ipc::cleanup(&config::socket_path());
         iced::exit()
+    }
+
+    /// Adds whatever a line of text describes: see `intake::parse`.
+    pub fn intake(&mut self, text: &str) {
+        match intake::parse(text, self.today) {
+            Err(e) => self.toast(e, true),
+            Ok(Intake::Item(t)) => self.add_item_text(&t),
+            Ok(Intake::Card {
+                title,
+                due,
+                board,
+                tags,
+            }) => {
+                // Without a board in the text, the one on screen.
+                let current = self
+                    .boards
+                    .iter()
+                    .find(|b| Some(b.id) == self.board_id)
+                    .map(|b| b.name.clone());
+                let board = board.or(current);
+                match intake::add_card(&self.db, &title, due, board.as_deref(), &tags, now()) {
+                    Ok((_, place)) => {
+                        self.reload_board();
+                        self.toast(format!("Added \"{title}\" to {place}"), false);
+                    }
+                    Err(e) => self.toast(e, true),
+                }
+            }
+        }
+    }
+
+    pub fn add_item_text(&mut self, text: &ItemText) {
+        match intake::add_item(&self.db, text, self.today, false) {
+            Ok(Added::Duplicate(i)) => {
+                self.toast(format!("\"{}\" is already in the calendar", i.title), false)
+            }
+            Ok(added) => {
+                let title = added.item().title.clone();
+                self.reload_calendar();
+                self.toast(format!("Added \"{title}\" to the calendar"), false);
+            }
+            Err(e) => self.toast(e, true),
+        }
     }
 
     /// Adds a card to the first list of a board, by board name when given.
@@ -1230,7 +1405,12 @@ impl App {
                 }
                 let fx = self.timer.tick(now);
                 self.apply(fx);
+                self.minute_warning();
                 self.poll_theme();
+                if self.last_data_check.elapsed().as_millis() >= 900 {
+                    self.last_data_check = Instant::now();
+                    self.sync_outside();
+                }
                 self.reminders();
                 if self
                     .toast
@@ -1323,6 +1503,10 @@ impl App {
                     }
                     ConfirmAction::DeleteHabit(_) => "Delete this habit and its whole history?".to_string(),
                     ConfirmAction::DeleteCard(_) => "Delete this card? Logged sessions are kept.".to_string(),
+                    ConfirmAction::DeleteCalendar(id) => {
+                        let n = self.items.iter().filter(|i| i.calendar_id == *id).count();
+                        format!("Delete this calendar and its {n} item(s)?")
+                    }
                     ConfirmAction::ImportData => {
                         "Importing replaces everything currently in Pomolog. Continue?".to_string()
                     }
@@ -1431,7 +1615,15 @@ impl App {
             | Message::ItemDelete(_)
             | Message::ItemDone(..)
             | Message::IcsKind(_)
-            | Message::IcsImport) => return self.update_calendar(m),
+            | Message::IcsImport
+            | Message::IcsCalendar(_)
+            | Message::ItemCalendar(_)
+            | Message::ItemNotes(_)
+            | Message::CalendarNew
+            | Message::CalendarOpen(_)
+            | Message::CalendarColor(_)
+            | Message::CalendarSave
+            | Message::CalendarVisible(..)) => return self.update_calendar(m),
 
             m @ (Message::HabitNew
             | Message::HabitOpen(_)
@@ -1451,8 +1643,11 @@ impl App {
             m @ (Message::SetTheme(_)
             | Message::SetMode(_)
             | Message::SetSource(_)
+            | Message::SetClock(_)
             | Message::SetRadius(_)
             | Message::SetScale(_)
+            | Message::SetVolume(_)
+            | Message::TestSound
             | Message::SetEveryN(_)
             | Message::OverrideClear(_)
             | Message::ThemeSaveAs
@@ -1499,6 +1694,17 @@ impl App {
     ) -> Task<Message> {
         use keyboard::Key;
         use keyboard::key::Named;
+        // Single keys act only when no text field or dialog is in the way.
+        let free = !captured && matches!(self.modal, Modal::None);
+        let chord = std::mem::take(&mut self.pending_g);
+        if free
+            && self.cfg.keys.vim
+            && !mods.command()
+            && !mods.alt()
+            && let Some(task) = self.vim_key(&key, mods, chord)
+        {
+            return task;
+        }
         match key.as_ref() {
             Key::Named(Named::Escape) => {
                 if !matches!(self.modal, Modal::None) {
@@ -1543,8 +1749,8 @@ impl App {
                 self.update(Message::Zen(!self.zen))
             }
             Action::StartCard(id) => self.update(Message::StartCard(id)),
-            Action::NewCard(title) => {
-                self.quick_add(&title, None, None);
+            Action::Intake(text) => {
+                self.intake(&text);
                 Task::none()
             }
             Action::Theme(name) => self.update(Message::SetTheme(name)),
@@ -1584,10 +1790,11 @@ impl App {
             .into_iter()
             .filter(|(label, _)| q.is_empty() || label.to_lowercase().contains(&q))
             .collect();
-        if !q.is_empty() {
+        // Anything typed can also be added: the intake says as what.
+        if let Ok(what) = intake::parse(query, self.today) {
             hits.push((
-                format!("New card: {}", query.trim()),
-                Action::NewCard(query.trim().to_string()),
+                format!("Add {}", what.describe()),
+                Action::Intake(query.trim().to_string()),
             ));
         }
         hits.truncate(9);
@@ -1628,7 +1835,7 @@ impl App {
             | Field::ItemTime
             | Field::ItemDuration
             | Field::ItemUntil
-            | Field::ItemNotes => {
+            | Field::ItemTz => {
                 if let Modal::Item(i) = &mut self.modal {
                     match f {
                         Field::ItemTitle => i.title = v,
@@ -1636,7 +1843,15 @@ impl App {
                         Field::ItemTime => i.time = v,
                         Field::ItemDuration => i.duration = v,
                         Field::ItemUntil => i.until = v,
-                        _ => i.notes = v,
+                        _ => i.tz = v,
+                    }
+                }
+            }
+            Field::CalendarName | Field::CalendarTz => {
+                if let Modal::Calendar(c) = &mut self.modal {
+                    match f {
+                        Field::CalendarName => c.name = v,
+                        _ => c.tz = v,
                     }
                 }
             }
@@ -1708,8 +1923,12 @@ impl App {
             | Field::ItemDate
             | Field::ItemTime
             | Field::ItemDuration
-            | Field::ItemUntil => {
+            | Field::ItemUntil
+            | Field::ItemTz => {
                 return self.update(Message::ItemSave);
+            }
+            Field::CalendarName | Field::CalendarTz => {
+                return self.update(Message::CalendarSave);
             }
             Field::HabitName | Field::HabitTarget | Field::HabitUnit | Field::HabitTag => {
                 return self.update(Message::HabitSave);
@@ -1766,6 +1985,11 @@ impl App {
                 let res = self.db.delete_habit(id);
                 self.check(res);
                 self.reload_habits();
+            }
+            ConfirmAction::DeleteCalendar(id) => {
+                let res = self.db.delete_calendar(id);
+                self.check(res);
+                self.reload_calendar();
             }
             ConfirmAction::ImportData => self.import_data(),
             ConfirmAction::WipeData => {

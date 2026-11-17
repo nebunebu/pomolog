@@ -202,7 +202,7 @@ impl App {
         self.reload_sessions();
     }
 
-    fn card_matches(&self, c: &Card) -> bool {
+    pub(super) fn card_matches(&self, c: &Card) -> bool {
         let q = self.search.trim().to_lowercase();
         if q.is_empty() {
             return true;
@@ -222,6 +222,8 @@ impl App {
         let drag = self.drag.as_ref().filter(|d| d.active);
         let dragging = drag.is_some_and(|d| d.card == c.id);
         let target = drag.is_some_and(|d| d.over_card == Some(c.id) && d.card != c.id);
+        // Chosen with the keyboard.
+        let target = target || self.board_sel == Some(c.id);
         let focus_s = self.timer.cfg.focus_s.max(1) as f64;
 
         let mut meta = row![].spacing(5).align_y(Alignment::Center);
@@ -477,7 +479,11 @@ impl App {
         }
         tools = tools
             .push(Space::new().width(p.u))
-            .push(field(p, "Search cards, or #tag", &self.search, Field::BoardSearch).width(220))
+            .push(
+                field(p, "Search cards, or #tag", &self.search, Field::BoardSearch)
+                    .id("board-search")
+                    .width(220),
+            )
             .push(action(
                 p,
                 Btn::Soft,

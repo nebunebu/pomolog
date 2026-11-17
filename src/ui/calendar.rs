@@ -1,22 +1,39 @@
 //! Month and week calendar. Holidays, appointments, deadlines and habits are
 //! four different things and are drawn four different ways.
 
-use super::app::{App, El, Field, ItemEdit, Message, Modal, Toggle};
+use super::app::{App, CalendarEdit, ConfirmAction, El, Field, ItemEdit, Message, Modal, Toggle};
 use super::shell::{action, empty, field, icon_btn, labelled, page, vscroll};
 use super::style::{self, Btn, P, alpha, btn, chip, icon, mix};
 use crate::core::habits::{self, DayState};
 use crate::core::model::*;
-use crate::core::{dates, ics, recur};
-use chrono::{Datelike, Duration, NaiveDate};
-use iced::widget::{Space, button, checkbox, column, container, pick_list, row, space, text};
+use crate::core::{dates, ics, tz};
+use chrono::{Datelike, Duration, NaiveDate, NaiveTime};
+use iced::widget::{
+    Space, button, checkbox, column, container, pick_list, row, space, text, text_editor,
+};
 use iced::{Alignment, Border, Color, Fill, Length, Task};
 
-const FILTERS: [(&str, &str); 4] = [
+const FILTERS: [(&str, &str); 5] = [
     ("Holidays", "star"),
     ("Appointments", "clock"),
     ("Deadlines", "flag"),
     ("Habits", "habits"),
+    ("Notes", "note"),
 ];
+
+/// Colours a calendar can be given.
+pub const SWATCHES: [&str; 8] = [
+    "#e5484d", "#f08c3a", "#e2b93d", "#46a758", "#3ba7a0", "#4a8fe7", "#8e6fe0", "#d6589f",
+];
+
+fn kind_icon(kind: ItemKind) -> &'static str {
+    match kind {
+        ItemKind::Holiday => "star",
+        ItemKind::Appointment => "clock",
+        ItemKind::Deadline => "flag",
+        ItemKind::Note => "note",
+    }
+}
 
 /// A distinct colour per habit, so stacked chain lines can be told apart.
 pub fn habit_color(p: P, index: usize) -> Color {
@@ -35,7 +52,28 @@ impl App {
             ItemKind::Holiday => p.holiday,
             ItemKind::Appointment => p.appointment,
             ItemKind::Deadline => p.deadline,
+            ItemKind::Note => p.dim,
         }
+    }
+
+    fn calendar_color(&self, id: Id) -> Option<Color> {
+        let c = self.calendars.iter().find(|c| c.id == id)?;
+        crate::theme::Rgb::parse(c.color.as_deref()?).map(style::col)
+    }
+
+    /// The colour of its calendar if that has one, else the colour of its
+    /// kind.
+    fn item_color(&self, p: P, i: &Item) -> Color {
+        self.calendar_color(i.calendar_id)
+            .unwrap_or_else(|| self.kind_color(p, i.kind))
+    }
+
+    fn calendar_tz(&self, id: Id) -> String {
+        self.calendars
+            .iter()
+            .find(|c| c.id == id)
+            .and_then(|c| c.tz.clone())
+            .unwrap_or_default()
     }
 
     pub(super) fn update_calendar(&mut self, m: Message) -> Task<Message> {
@@ -54,6 +92,12 @@ impl App {
             }
             Message::CalSelect(d) => self.cal_selected = d,
             Message::ItemNew(kind, date) => {
+                // The first calendar that is switched on.
+                let calendar = self
+                    .calendars
+                    .iter()
+                    .find(|c| c.visible)
+                    .map_or(DEFAULT_CALENDAR, |c| c.id);
                 self.modal = Modal::Item(ItemEdit {
                     id: 0,
                     kind,
@@ -63,9 +107,11 @@ impl App {
                     duration: String::new(),
                     recur: Recur::None,
                     until: String::new(),
-                    notes: String::new(),
+                    notes: text_editor::Content::new(),
                     done: false,
                     source: None,
+                    calendar,
+                    tz: self.calendar_tz(calendar),
                 });
                 return iced::widget::operation::focus("item-title");
             }
@@ -83,9 +129,11 @@ impl App {
                         duration: i.duration_min.map(|d| d.to_string()).unwrap_or_default(),
                         recur: i.recur,
                         until: i.recur_until.map(|d| d.to_string()).unwrap_or_default(),
-                        notes: i.notes.clone(),
+                        notes: text_editor::Content::with_text(&i.notes),
                         done: i.done,
                         source: i.source.clone(),
+                        calendar: i.calendar_id,
+                        tz: i.tz.clone().unwrap_or_default(),
                     });
                 }
             }
@@ -114,13 +162,62 @@ impl App {
                     self.reload_calendar();
                 }
             }
+            Message::ItemCalendar(c) => {
+                let zone = self.calendar_tz(c.id);
+                if let Modal::Item(i) = &mut self.modal {
+                    // A new item follows the zone of the calendar it goes in.
+                    if i.id == 0 {
+                        i.tz = zone;
+                    }
+                    i.calendar = c.id;
+                }
+            }
+            Message::ItemNotes(action) => {
+                if let Modal::Item(i) = &mut self.modal {
+                    i.notes.perform(action);
+                }
+            }
+            Message::CalendarNew => {
+                self.modal = Modal::Calendar(CalendarEdit {
+                    id: 0,
+                    name: String::new(),
+                    color: Some(SWATCHES[self.calendars.len() % SWATCHES.len()].to_string()),
+                    tz: String::new(),
+                });
+                return iced::widget::operation::focus("calendar-name");
+            }
+            Message::CalendarOpen(id) => {
+                if let Some(c) = self.calendars.iter().find(|c| c.id == id) {
+                    self.modal = Modal::Calendar(CalendarEdit {
+                        id,
+                        name: c.name.clone(),
+                        color: c.color.clone(),
+                        tz: c.tz.clone().unwrap_or_default(),
+                    });
+                }
+            }
+            Message::CalendarColor(color) => {
+                if let Modal::Calendar(c) = &mut self.modal {
+                    c.color = color;
+                }
+            }
+            Message::CalendarSave => self.calendar_save(),
+            Message::CalendarVisible(id, on) => {
+                if let Some(mut c) = self.calendars.iter().find(|c| c.id == id).cloned() {
+                    c.visible = on;
+                    let res = self.db.save_calendar(&c);
+                    self.check(res);
+                    self.reload_calendar();
+                }
+            }
+            Message::IcsCalendar(c) => self.ics_calendar = c.id,
             Message::IcsKind(k) => self.ics_kind = k,
             Message::IcsImport => {
                 let path = Self::expand_path(&self.ics_path);
                 match std::fs::read_to_string(&path) {
                     Err(e) => self.toast(format!("Could not read {}: {e}", path.display()), true),
                     Ok(text) => {
-                        let res = ics::import(&self.db, &text, self.ics_kind);
+                        let res = ics::import(&self.db, &text, self.ics_kind, self.ics_calendar);
                         if let Some((added, skipped)) = self.check(res) {
                             self.reload_calendar();
                             if added + skipped == 0 {
@@ -156,13 +253,30 @@ impl App {
                 "Could not read the date. Try 2026-12-01, tomorrow, fri or +3d.",
             );
         };
-        let holiday = e.kind == ItemKind::Holiday;
+        let mut zone = match e.tz.trim() {
+            "" => None,
+            z => match tz::canonical(z) {
+                Some(z) => Some(z),
+                None => {
+                    return fail(
+                        self,
+                        "Unknown time zone. Try America/New_York, Eastern or UTC.",
+                    );
+                }
+            },
+        };
         let time = match e.time.trim() {
             "" => None,
-            _ if holiday => None,
-            s => match dates::parse_time(s) {
-                Some(t) => Some(t),
-                None => return fail(self, "Could not read the time. Try 14:30."),
+            _ if !e.kind.timed() => None,
+            // "9pm Eastern" in the time field names the zone too.
+            s => match tz::parse_time(s) {
+                Some((t, z)) => {
+                    if let Some(z) = z {
+                        zone = Some(z.name().to_string());
+                    }
+                    Some(t)
+                }
+                None => return fail(self, "Could not read the time. Try 14:30 or 2:30pm."),
             },
         };
         let duration_min = match e.duration.trim() {
@@ -173,50 +287,98 @@ impl App {
                 _ => return fail(self, "The duration is a number of minutes."),
             },
         };
-        // A deadline is a single date with a done flag, so it does not repeat.
-        let recur = if e.kind == ItemKind::Deadline {
-            Recur::None
-        } else {
-            e.recur
-        };
         let recur_until = match e.until.trim() {
             "" => None,
-            _ if recur == Recur::None => None,
+            _ if e.recur == Recur::None || e.kind == ItemKind::Deadline => None,
             s => match dates::parse_date(s, self.today) {
                 Some(d) if d >= date => Some(d),
                 Some(_) => return fail(self, "The end date is before the start."),
                 None => return fail(self, "Could not read the end date."),
             },
         };
-        let item = Item {
+        let mut item = Item {
             id: e.id,
             kind: e.kind,
             title,
             date,
             time,
             duration_min,
-            recur,
+            recur: e.recur,
             recur_until,
-            done: e.done && e.kind == ItemKind::Deadline,
+            done: e.done,
             source: e.source.clone(),
-            notes: e.notes.clone(),
+            notes: e.notes.text().trim_end().to_string(),
+            calendar_id: e.calendar,
+            tz: zone,
         };
+        // Drops what the kind has no use for: a deadline does not repeat, a
+        // holiday or a note has no time.
+        item.normalise();
         let res = self.db.save_item(&item);
         if self.check(res).is_some() {
             self.modal = Modal::None;
             self.cal_selected = date;
+            self.cal_month = dates::month_start(date);
             self.reload_calendar();
         }
     }
 
-    /// One line for an item as it occurs on `date`.
-    pub(super) fn item_row<'a>(&'a self, p: P, i: &'a Item, date: NaiveDate) -> El<'a> {
-        let tint = self.kind_color(p, i.kind);
-        let name = match i.kind {
-            ItemKind::Holiday => "star",
-            ItemKind::Appointment => "clock",
-            ItemKind::Deadline => "flag",
+    fn calendar_save(&mut self) {
+        let Modal::Calendar(e) = &self.modal else {
+            return;
         };
+        let name = e.name.trim().to_string();
+        if name.is_empty() {
+            return self.toast("Give the calendar a name.", true);
+        }
+        if self
+            .calendars
+            .iter()
+            .any(|c| c.id != e.id && c.name.eq_ignore_ascii_case(&name))
+        {
+            return self.toast("There is already a calendar with that name.", true);
+        }
+        let zone = match e.tz.trim() {
+            "" => None,
+            z => match tz::canonical(z) {
+                Some(z) => Some(z),
+                None => {
+                    return self.toast(
+                        "Unknown time zone. Try America/New_York, Eastern or UTC.",
+                        true,
+                    );
+                }
+            },
+        };
+        let visible = self
+            .calendars
+            .iter()
+            .find(|c| c.id == e.id)
+            .is_none_or(|c| c.visible);
+        let cal = Calendar {
+            id: e.id,
+            name,
+            color: e.color.clone(),
+            tz: zone,
+            visible,
+        };
+        let res = self.db.save_calendar(&cal);
+        if self.check(res).is_some() {
+            self.modal = Modal::None;
+            self.reload_calendar();
+        }
+    }
+
+    /// One line for an item as it occurs on `date`, at local time `time`.
+    pub(super) fn item_row<'a>(
+        &'a self,
+        p: P,
+        i: &'a Item,
+        date: NaiveDate,
+        time: Option<NaiveTime>,
+    ) -> El<'a> {
+        let tint = self.item_color(p, i);
+        let name = kind_icon(i.kind);
         let late = i.kind == ItemKind::Deadline && !i.done && date < self.today;
         let mut line = row![].spacing(8).align_y(Alignment::Center);
         if i.kind == ItemKind::Deadline {
@@ -233,24 +395,43 @@ impl App {
         } else {
             line = line.push(container(icon(name, 15.0, tint)).padding(4));
         }
-        if let Some(t) = i.time {
+        if let Some(t) = time {
             let end = i.duration_min.map(|m| t + Duration::minutes(m));
             let label = match end {
-                Some(e) => format!("{}–{}", t.format("%H:%M"), e.format("%H:%M")),
-                None => t.format("%H:%M").to_string(),
+                Some(e) => format!("{}–{}", self.time_text(t), self.time_text(e)),
+                None => self.time_text(t),
             };
             line = line.push(text(label).size(12).color(tint));
         }
-        line = line.push(text(&i.title).size(13).width(Fill).color(if i.done {
-            p.dim
+        let title = text(&i.title)
+            .size(13)
+            .color(if i.done { p.dim } else { p.text });
+        if i.kind == ItemKind::Note && !i.notes.is_empty() {
+            line = line.push(
+                column![title, text(&i.notes).size(12).color(p.dim)]
+                    .spacing(2)
+                    .width(Fill),
+            );
         } else {
-            p.text
-        }));
+            line = line.push(title.width(Fill));
+        }
         if late {
             line = line.push(chip(
                 p,
                 format!("overdue · {}", dates::relative(date, self.today)),
                 p.danger,
+            ));
+        }
+        // Written in another zone: say what it was there.
+        if let (Some(t), Some(z)) = (i.time, i.tz.as_deref()) {
+            line = line.push(chip(
+                p,
+                format!(
+                    "{} {}",
+                    self.time_text(t),
+                    tz::abbreviation(date.and_time(t), z)
+                ),
+                p.dim,
             ));
         }
         if i.recur != Recur::None {
@@ -265,10 +446,11 @@ impl App {
     }
 
     fn day_cell(&self, p: P, d: NaiveDate, in_month: bool, max_items: usize) -> El<'_> {
-        let [f_hol, f_appt, f_dead, f_habit] = self.cal_filters;
-        let items = recur::on_day(&self.items, d);
+        let [f_hol, f_appt, f_dead, f_habit, f_note] = self.cal_filters;
+        let items = self.day_items(d);
         let holiday = items
             .iter()
+            .map(|o| o.item)
             .find(|i| i.kind == ItemKind::Holiday)
             .filter(|_| f_hol);
         let selected = d == self.cal_selected;
@@ -303,17 +485,45 @@ impl App {
         // Timed and dated things, as chips.
         let mut lines: Vec<El> = Vec::new();
         if f_appt {
-            for i in items.iter().filter(|i| i.kind == ItemKind::Appointment) {
-                let label = match i.time {
-                    Some(t) => format!("{} {}", t.format("%H:%M"), i.title),
-                    None => i.title.clone(),
+            for o in items
+                .iter()
+                .filter(|o| o.item.kind == ItemKind::Appointment)
+            {
+                let label = match o.time {
+                    Some(t) => format!("{} {}", self.time_text(t), o.item.title),
+                    None => o.item.title.clone(),
                 };
-                lines.push(cell_line(p, label, p.appointment, false, false));
+                lines.push(cell_line(
+                    p,
+                    label,
+                    self.item_color(p, o.item),
+                    false,
+                    false,
+                ));
+            }
+        }
+        if f_note {
+            for o in items.iter().filter(|o| o.item.kind == ItemKind::Note) {
+                let i = o.item;
+                lines.push(cell_line(
+                    p,
+                    i.title.clone(),
+                    self.item_color(p, i),
+                    false,
+                    false,
+                ));
             }
         }
         if f_dead {
-            for i in items.iter().filter(|i| i.kind == ItemKind::Deadline) {
-                lines.push(cell_line(p, i.title.clone(), p.deadline, true, i.done));
+            for o in items.iter().filter(|o| o.item.kind == ItemKind::Deadline) {
+                let i = o.item;
+                lines.push(cell_line(
+                    p,
+                    i.title.clone(),
+                    self.item_color(p, i),
+                    true,
+                    i.done,
+                ));
             }
             for (c, _, done) in self.due_cards.iter().filter(|(c, ..)| c.due == Some(d)) {
                 lines.push(cell_line(p, c.title.clone(), p.deadline, true, *done));
@@ -418,7 +628,7 @@ impl App {
 
     fn day_detail(&self, p: P) -> El<'_> {
         let d = self.cal_selected;
-        let items = recur::on_day(&self.items, d);
+        let items = self.day_items(d);
         let mut col = column![
             text(d.format("%A").to_string()).size(12).color(p.dim),
             text(d.format("%-d %B %Y").to_string()).size(19),
@@ -427,9 +637,9 @@ impl App {
 
         let mut list = column![].spacing(2);
         let mut any = false;
-        for i in &items {
+        for o in &items {
             any = true;
-            list = list.push(self.item_row(p, i, d));
+            list = list.push(self.item_row(p, o.item, d, o.time));
         }
         for (c, board, done) in self.due_cards.iter().filter(|(c, ..)| c.due == Some(d)) {
             any = true;
@@ -517,13 +727,62 @@ impl App {
                 ]
                 .spacing(6),
             );
-        col = col.push(action(
-            p,
-            Btn::Tint(p.holiday),
-            Some("star"),
-            "Holiday or day off",
-            Message::ItemNew(ItemKind::Holiday, d),
-        ));
+        col = col.push(
+            row![
+                action(
+                    p,
+                    Btn::Tint(p.holiday),
+                    Some("star"),
+                    "Holiday or day off",
+                    Message::ItemNew(ItemKind::Holiday, d),
+                ),
+                action(
+                    p,
+                    Btn::Soft,
+                    Some("note"),
+                    "Note",
+                    Message::ItemNew(ItemKind::Note, d)
+                ),
+            ]
+            .spacing(6),
+        );
+
+        // Calendars: tick to show, click the name to edit.
+        let mut cals = column![].spacing(2);
+        for c in &self.calendars {
+            let swatch = self.calendar_color(c.id).unwrap_or(p.appointment);
+            cals = cals.push(
+                row![
+                    checkbox(c.visible).on_toggle({
+                        let id = c.id;
+                        move |on| Message::CalendarVisible(id, on)
+                    }),
+                    container(Space::new().width(10).height(10)).style(style::panel(p, swatch)),
+                    button(
+                        text(&c.name)
+                            .size(13)
+                            .color(if c.visible { p.text } else { p.dim })
+                    )
+                    .width(Fill)
+                    .padding([3.0, 4.0])
+                    .style(btn(p, Btn::Ghost))
+                    .on_press(Message::CalendarOpen(c.id)),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            );
+        }
+        col = col
+            .push(Space::new().height(p.u * 1.5))
+            .push(style::h2(p, "CALENDARS"))
+            .push(cals)
+            .push(action(
+                p,
+                Btn::Soft,
+                Some("plus"),
+                "New calendar",
+                Message::CalendarNew,
+            ));
 
         col = col
             .push(Space::new().height(p.u * 1.5))
@@ -538,10 +797,20 @@ impl App {
                 row![
                     pick_list(&ItemKind::ALL[..2], Some(self.ics_kind), Message::IcsKind)
                         .text_size(13),
+                    pick_list(
+                        self.calendars.clone(),
+                        self.calendars
+                            .iter()
+                            .find(|c| c.id == self.ics_calendar)
+                            .cloned(),
+                        Message::IcsCalendar
+                    )
+                    .text_size(13),
                     action(p, Btn::Soft, None, "Import", Message::IcsImport),
                 ]
                 .spacing(6)
-                .align_y(Alignment::Center),
+                .align_y(Alignment::Center)
+                .wrap(),
             )
             .push(style::dim(p, "Public holiday calendars are published as .ics files.").size(11));
 
@@ -625,7 +894,7 @@ impl App {
         }
 
         let mut filters = row![].spacing(6).align_y(Alignment::Center);
-        let tints = [p.holiday, p.appointment, p.deadline, p.habit];
+        let tints = [p.holiday, p.appointment, p.deadline, p.habit, p.dim];
         for (i, (label, name)) in FILTERS.iter().enumerate() {
             let on = self.cal_filters[i];
             filters = filters.push(
@@ -703,7 +972,8 @@ impl App {
     pub(super) fn item_editor<'a>(&'a self, p: P, e: &'a ItemEdit) -> El<'a> {
         let tint = self.kind_color(p, e.kind);
         let date_bad = dates::parse_date(&e.date, self.today).is_none();
-        let time_bad = !e.time.trim().is_empty() && dates::parse_time(&e.time).is_none();
+        let time_bad = !e.time.trim().is_empty() && tz::parse_time(&e.time).is_none();
+        let tz_bad = !e.tz.trim().is_empty() && tz::parse(&e.tz).is_none();
         let mut kinds = row![].spacing(6);
         for k in ItemKind::ALL {
             kinds = kinds.push(action(
@@ -713,17 +983,13 @@ impl App {
                 } else {
                     Btn::Ghost
                 },
-                Some(match k {
-                    ItemKind::Holiday => "star",
-                    ItemKind::Appointment => "clock",
-                    ItemKind::Deadline => "flag",
-                }),
+                Some(kind_icon(k)),
                 k.label(),
                 Message::ItemKindSet(k),
             ));
         }
         let mut col = column![
-            kinds,
+            kinds.wrap(),
             field(p, "Title", &e.title, Field::ItemTitle)
                 .id("item-title")
                 .size(15),
@@ -733,15 +999,15 @@ impl App {
         let mut when = row![labelled(
             p,
             "DATE",
-            field(p, "2026-12-01, fri, +3d", &e.date, Field::ItemDate)
+            field(p, "2026-12-01, fri, Jan 5", &e.date, Field::ItemDate)
                 .style(style::input_checked(p, date_bad))
         )]
         .spacing(p.u * 1.5);
-        if e.kind != ItemKind::Holiday {
+        if e.kind.timed() {
             when = when.push(labelled(
                 p,
                 "TIME (OPTIONAL)",
-                field(p, "14:30", &e.time, Field::ItemTime)
+                field(p, "14:30 or 2:30pm", &e.time, Field::ItemTime)
                     .style(style::input_checked(p, time_bad)),
             ));
         }
@@ -753,6 +1019,28 @@ impl App {
             ));
         }
         col = col.push(when);
+
+        let mut place = row![labelled(
+            p,
+            "CALENDAR",
+            pick_list(
+                self.calendars.clone(),
+                self.calendars.iter().find(|c| c.id == e.calendar).cloned(),
+                Message::ItemCalendar
+            )
+            .width(190)
+            .text_size(13)
+        )]
+        .spacing(p.u * 1.5);
+        if e.kind.timed() {
+            place = place.push(labelled(
+                p,
+                "TIME ZONE (LOCAL IF EMPTY)",
+                field(p, "Eastern, Europe/Berlin", &e.tz, Field::ItemTz)
+                    .style(style::input_checked(p, tz_bad)),
+            ));
+        }
+        col = col.push(place);
 
         match e.kind {
             ItemKind::Deadline => {
@@ -782,11 +1070,17 @@ impl App {
                 col = col.push(rep);
             }
         }
-        col = col.push(labelled(
-            p,
-            "NOTES",
-            field(p, "", &e.notes, Field::ItemNotes),
-        ));
+        col = col.push(
+            text_editor(&e.notes)
+                .placeholder(if e.kind == ItemKind::Note {
+                    "The note"
+                } else {
+                    "Notes"
+                })
+                .on_action(Message::ItemNotes)
+                .height(if e.kind == ItemKind::Note { 150 } else { 70 })
+                .size(13),
+        );
         if e.kind == ItemKind::Holiday {
             col = col.push(
                 style::dim(
@@ -812,6 +1106,69 @@ impl App {
             .push(action(p, Btn::Ghost, None, "Cancel", Message::CloseModal))
             .push(action(p, Btn::Tint(tint), None, "Save", Message::ItemSave));
         col.push(buttons).into()
+    }
+
+    pub(super) fn calendar_editor<'a>(&'a self, p: P, e: &'a CalendarEdit) -> El<'a> {
+        let tz_bad = !e.tz.trim().is_empty() && tz::parse(&e.tz).is_none();
+        let swatch = |color: Option<Color>, value: Option<String>, on: bool| -> El<'a> {
+            let fill = color.unwrap_or(p.surface3);
+            button(Space::new().width(18).height(18))
+                .padding(0)
+                .style(move |_, _| iced::widget::button::Style {
+                    background: Some(fill.into()),
+                    border: Border {
+                        color: if on { p.text } else { alpha(p.outline, 0.6) },
+                        width: if on { 2.0 } else { 1.0 },
+                        radius: 99.0.into(),
+                    },
+                    ..Default::default()
+                })
+                .on_press(Message::CalendarColor(value))
+                .into()
+        };
+        let mut colours = row![swatch(None, None, e.color.is_none())]
+            .spacing(8)
+            .align_y(Alignment::Center);
+        for hex in SWATCHES {
+            colours = colours.push(swatch(
+                crate::theme::Rgb::parse(hex).map(style::col),
+                Some(hex.to_string()),
+                e.color.as_deref() == Some(hex),
+            ));
+        }
+        let mut buttons = row![].spacing(8).align_y(Alignment::Center);
+        if e.id != 0 && e.id != DEFAULT_CALENDAR {
+            buttons = buttons.push(action(
+                p,
+                Btn::Danger,
+                Some("trash"),
+                "Delete",
+                Message::Ask(ConfirmAction::DeleteCalendar(e.id)),
+            ));
+        }
+        buttons = buttons
+            .push(space::horizontal())
+            .push(action(p, Btn::Ghost, None, "Cancel", Message::CloseModal))
+            .push(action(p, Btn::Primary, None, "Save", Message::CalendarSave));
+        column![
+            text(if e.id == 0 {
+                "New calendar"
+            } else {
+                "Calendar"
+            })
+            .size(17),
+            field(p, "Name", &e.name, Field::CalendarName).id("calendar-name"),
+            labelled(p, "COLOUR (FIRST IS THE THEME'S)", colours),
+            labelled(
+                p,
+                "TIME ZONE FOR NEW ITEMS (LOCAL IF EMPTY)",
+                field(p, "Eastern, Europe/Berlin", &e.tz, Field::CalendarTz)
+                    .style(style::input_checked(p, tz_bad))
+            ),
+            buttons,
+        ]
+        .spacing(p.u * 1.5)
+        .into()
     }
 }
 

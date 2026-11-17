@@ -144,21 +144,30 @@ pub enum ItemKind {
     Holiday,
     Appointment,
     Deadline,
+    /// A dated note: a title and a body, no time.
+    Note,
 }
 
 impl ItemKind {
-    pub const ALL: [ItemKind; 3] = [ItemKind::Holiday, ItemKind::Appointment, ItemKind::Deadline];
+    pub const ALL: [ItemKind; 4] = [
+        ItemKind::Holiday,
+        ItemKind::Appointment,
+        ItemKind::Deadline,
+        ItemKind::Note,
+    ];
     pub fn as_str(self) -> &'static str {
         match self {
             ItemKind::Holiday => "holiday",
             ItemKind::Appointment => "appointment",
             ItemKind::Deadline => "deadline",
+            ItemKind::Note => "note",
         }
     }
     pub fn parse(s: &str) -> Self {
         match s {
             "holiday" => ItemKind::Holiday,
             "deadline" => ItemKind::Deadline,
+            "note" => ItemKind::Note,
             _ => ItemKind::Appointment,
         }
     }
@@ -167,7 +176,12 @@ impl ItemKind {
             ItemKind::Holiday => "Holiday",
             ItemKind::Appointment => "Appointment",
             ItemKind::Deadline => "Deadline",
+            ItemKind::Note => "Note",
         }
+    }
+    /// Only appointments and deadlines have a time of day.
+    pub fn timed(self) -> bool {
+        matches!(self, ItemKind::Appointment | ItemKind::Deadline)
     }
 }
 
@@ -226,6 +240,39 @@ impl std::fmt::Display for Recur {
     }
 }
 
+/// The calendar every database has; it cannot be deleted.
+pub const DEFAULT_CALENDAR: Id = 1;
+
+/// A named group of calendar items that can be shown or hidden together.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Calendar {
+    pub id: Id,
+    pub name: String,
+    /// `#rrggbb`; without one, items use the theme's colour for their kind.
+    pub color: Option<String>,
+    /// The zone new items in this calendar are written in.
+    pub tz: Option<String>,
+    pub visible: bool,
+}
+
+impl Calendar {
+    pub fn new(name: impl Into<String>) -> Self {
+        Calendar {
+            id: 0,
+            name: name.into(),
+            color: None,
+            tz: None,
+            visible: true,
+        }
+    }
+}
+
+impl std::fmt::Display for Calendar {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.name)
+    }
+}
+
 /// A dated calendar entry that is not a kanban card.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Item {
@@ -241,6 +288,9 @@ pub struct Item {
     /// Identifier of the imported event, used to avoid duplicates.
     pub source: Option<String>,
     pub notes: String,
+    pub calendar_id: Id,
+    /// IANA zone the date and time are written in; `None` is local time.
+    pub tz: Option<String>,
 }
 
 impl Item {
@@ -257,7 +307,213 @@ impl Item {
             done: false,
             source: None,
             notes: String::new(),
+            calendar_id: DEFAULT_CALENDAR,
+            tz: None,
         }
+    }
+
+    /// Drops the fields its kind has no use for: holidays and notes have no
+    /// time, a duration needs a time, a deadline is one date with a done flag.
+    pub fn normalise(&mut self) {
+        if !self.kind.timed() {
+            self.time = None;
+        }
+        if self.time.is_none() || self.kind != ItemKind::Appointment {
+            self.duration_min = None;
+        }
+        if self.time.is_none() {
+            self.tz = None;
+        }
+        if self.kind == ItemKind::Deadline {
+            self.recur = Recur::None;
+        } else {
+            self.done = false;
+        }
+        if self.recur == Recur::None {
+            self.recur_until = None;
+        }
+    }
+}
+
+/// A calendar item as text: what the command line, the socket and a bulk
+/// import give. Everything is optional so the same shape describes a change
+/// to an existing item.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ItemText {
+    pub title: String,
+    pub date: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(alias = "repeat", skip_serializing_if = "Option::is_none")]
+    pub recur: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub until: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub calendar: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tz: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+/// "none", "-" or nothing at all clears an optional field.
+fn clears(s: &str) -> bool {
+    matches!(s.trim().to_ascii_lowercase().as_str(), "" | "none" | "-")
+}
+
+impl ItemText {
+    /// Fills in what this row leaves out from `defaults`.
+    pub fn or(mut self, defaults: &ItemText) -> ItemText {
+        self.time = self.time.or_else(|| defaults.time.clone());
+        self.duration = self.duration.or(defaults.duration);
+        self.kind = self.kind.or_else(|| defaults.kind.clone());
+        self.recur = self.recur.or_else(|| defaults.recur.clone());
+        self.until = self.until.or_else(|| defaults.until.clone());
+        self.calendar = self.calendar.or_else(|| defaults.calendar.clone());
+        self.tz = self.tz.or_else(|| defaults.tz.clone());
+        self
+    }
+
+    /// A new item, or what could not be read. A note without a date is for
+    /// today; everything else needs one.
+    pub fn build(&self, today: NaiveDate, calendars: &[Calendar]) -> Result<Item, String> {
+        if self.title.trim().is_empty() {
+            return Err("the title is empty".into());
+        }
+        let mut item = Item::new(ItemKind::Appointment, "", today);
+        if let Some(c) = calendars.first() {
+            item.calendar_id = c.id;
+        }
+        let is_note = self
+            .kind
+            .as_deref()
+            .is_some_and(|k| k.trim().eq_ignore_ascii_case("note"));
+        if self.date.trim().is_empty() && !is_note {
+            return Err("a date is needed (try 2026-12-01, tomorrow, fri, Jan 5)".into());
+        }
+        self.apply(&mut item, today, calendars)?;
+        Ok(item)
+    }
+
+    /// Changes the fields that are given and leaves the rest of `item` alone.
+    pub fn apply(
+        &self,
+        item: &mut Item,
+        today: NaiveDate,
+        calendars: &[Calendar],
+    ) -> Result<(), String> {
+        use crate::core::{dates, tz};
+        if !self.title.trim().is_empty() {
+            item.title = self.title.trim().to_string();
+        }
+        if !self.date.trim().is_empty() {
+            item.date = dates::parse_date(&self.date, today)
+                .ok_or_else(|| format!("could not read the date \"{}\"", self.date))?;
+        }
+        if let Some(k) = &self.kind {
+            let k = k.trim().to_ascii_lowercase();
+            item.kind = match k.as_str() {
+                "holiday" | "appointment" | "deadline" | "note" => ItemKind::parse(&k),
+                _ => {
+                    return Err(format!(
+                        "unknown kind \"{k}\" (holiday, appointment, deadline, note)"
+                    ));
+                }
+            };
+        }
+        let mut zone_set = false;
+        if let Some(name) = &self.calendar {
+            let cal = calendars
+                .iter()
+                .find(|c| c.name.eq_ignore_ascii_case(name.trim()))
+                .ok_or_else(|| {
+                    let names: Vec<&str> = calendars.iter().map(|c| c.name.as_str()).collect();
+                    format!(
+                        "there is no calendar called \"{name}\" (calendars: {})",
+                        names.join(", ")
+                    )
+                })?;
+            item.calendar_id = cal.id;
+        }
+        if let Some(t) = &self.time {
+            if clears(t) {
+                item.time = None;
+            } else {
+                let (time, zone) =
+                    tz::parse_time(t).ok_or_else(|| format!("could not read the time \"{t}\""))?;
+                item.time = Some(time);
+                if let Some(z) = zone {
+                    item.tz = Some(z.name().to_string());
+                    zone_set = true;
+                }
+            }
+        }
+        if let Some(z) = &self.tz {
+            item.tz = if clears(z) || z.trim().eq_ignore_ascii_case("local") {
+                None
+            } else {
+                Some(tz::canonical(z).ok_or_else(|| {
+                    format!("unknown time zone \"{z}\" (try America/New_York, Eastern, UTC)")
+                })?)
+            };
+            zone_set = true;
+        }
+        // A new item takes the zone of its calendar unless it names its own.
+        if !zone_set && item.id == 0 && item.tz.is_none() {
+            item.tz = calendars
+                .iter()
+                .find(|c| c.id == item.calendar_id)
+                .and_then(|c| c.tz.clone());
+        }
+        if let Some(d) = self.duration {
+            if d == 0 {
+                item.duration_min = None;
+            } else if !(1..=24 * 60).contains(&d) {
+                return Err("the duration is a number of minutes, up to a day".into());
+            } else {
+                item.duration_min = Some(d);
+            }
+        }
+        if let Some(r) = &self.recur {
+            let r = r.trim().to_ascii_lowercase();
+            item.recur = match r.as_str() {
+                "none" => Recur::None,
+                "daily" | "weekly" | "monthly" | "yearly" => Recur::parse(&r),
+                _ => {
+                    return Err(format!(
+                        "unknown repeat \"{r}\" (none, daily, weekly, monthly, yearly)"
+                    ));
+                }
+            };
+        }
+        if let Some(u) = &self.until {
+            item.recur_until = if clears(u) {
+                None
+            } else {
+                Some(
+                    dates::parse_date(u, today)
+                        .ok_or_else(|| format!("could not read the end date \"{u}\""))?,
+                )
+            };
+        }
+        if let Some(n) = &self.notes {
+            item.notes = n.trim().to_string();
+        }
+        if let Some(s) = &self.source {
+            item.source = (!s.trim().is_empty()).then(|| format!("cli:{}", s.trim()));
+        }
+        item.normalise();
+        if item.recur_until.is_some_and(|u| u < item.date) {
+            return Err("the end date is before the start".into());
+        }
+        Ok(())
     }
 }
 

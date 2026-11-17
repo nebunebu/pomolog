@@ -344,6 +344,8 @@ impl App {
             Modal::Card(c) => (520.0, self.card_editor(p, c)),
             Modal::Item(i) => (460.0, self.item_editor(p, i)),
             Modal::Habit(h) => (480.0, self.habit_editor(p, h)),
+            Modal::Calendar(c) => (420.0, self.calendar_editor(p, c)),
+            Modal::Keys => (560.0, self.keys_help(p)),
             Modal::Prompt { title, value, .. } => (
                 380.0,
                 column![
@@ -397,7 +399,7 @@ impl App {
                         Action::TimerToggle | Action::StartCard(_) => "play",
                         Action::TimerSkip => "skip",
                         Action::Zen => "zen",
-                        Action::NewCard(_) => "plus",
+                        Action::Intake(_) => "plus",
                         Action::Theme(_) => "moon",
                     };
                     list = list.push(
@@ -417,7 +419,7 @@ impl App {
                     column![
                         field(
                             p,
-                            "Type a command, a task to focus on, or a new card…",
+                            "A command, or something to add: Dentist fri 2pm, note: …",
                             query,
                             Field::PaletteQuery
                         )

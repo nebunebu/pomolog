@@ -3,7 +3,7 @@
 //! are converted to local. Only plain FREQ rules are kept as recurrence.
 
 use super::db::{Db, Result};
-use super::model::{Item, ItemKind, Recur};
+use super::model::{Id, Item, ItemKind, Recur};
 use chrono::{Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -143,9 +143,9 @@ fn build(props: &[(String, String, String)]) -> Option<Event> {
     })
 }
 
-/// Imports events as items of `kind`, skipping ones imported before.
-/// Returns (added, skipped).
-pub fn import(db: &Db, text: &str, kind: ItemKind) -> Result<(usize, usize)> {
+/// Imports events as items of `kind` into a calendar, skipping ones imported
+/// before. Returns (added, skipped).
+pub fn import(db: &Db, text: &str, kind: ItemKind, calendar: Id) -> Result<(usize, usize)> {
     let (mut added, mut skipped) = (0, 0);
     for ev in parse(text) {
         let source = format!("ics:{}:{}", ev.uid, ev.date);
@@ -153,20 +153,17 @@ pub fn import(db: &Db, text: &str, kind: ItemKind) -> Result<(usize, usize)> {
             skipped += 1;
             continue;
         }
-        let holiday = kind == ItemKind::Holiday;
-        db.save_item(&Item {
-            id: 0,
-            kind,
-            title: ev.summary,
-            date: ev.date,
-            time: if holiday { None } else { ev.time },
-            duration_min: if holiday { None } else { ev.duration_min },
+        let mut item = Item {
+            time: ev.time,
+            duration_min: ev.duration_min,
             recur: ev.recur,
             recur_until: ev.until,
-            done: false,
             source: Some(source),
-            notes: String::new(),
-        })?;
+            calendar_id: calendar,
+            ..Item::new(kind, ev.summary, ev.date)
+        };
+        item.normalise();
+        db.save_item(&item)?;
         added += 1;
     }
     Ok((added, skipped))
@@ -204,8 +201,8 @@ BEGIN:VEVENT\r\nDTSTART:20261102\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
     #[test]
     fn import_is_idempotent() {
         let db = Db::open_in_memory().unwrap();
-        assert_eq!(import(&db, SAMPLE, ItemKind::Holiday).unwrap(), (3, 0));
-        assert_eq!(import(&db, SAMPLE, ItemKind::Holiday).unwrap(), (0, 3));
+        assert_eq!(import(&db, SAMPLE, ItemKind::Holiday, 1).unwrap(), (3, 0));
+        assert_eq!(import(&db, SAMPLE, ItemKind::Holiday, 1).unwrap(), (0, 3));
         let items = db.items().unwrap();
         assert!(
             items

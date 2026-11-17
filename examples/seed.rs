@@ -199,7 +199,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
          END:VCALENDAR\r\n",
         y = year - 1
     );
-    ics::import(&db, &holidays, ItemKind::Holiday)?;
+    ics::import(&db, &holidays, ItemKind::Holiday, 1)?;
     db.save_item(&Item::new(
         ItemKind::Holiday,
         "Day off",
@@ -261,6 +261,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ItemKind::Deadline,
             "Send the invoice",
             today - Duration::days(4),
+        )
+    })?;
+
+    // A second calendar, with an item written in another time zone, and a note.
+    let friends = db.save_calendar(&Calendar {
+        color: Some("#8e6fe0".into()),
+        ..Calendar::new("Friends")
+    })?;
+    db.save_item(&Item {
+        time: NaiveTime::from_hms_opt(21, 0, 0),
+        duration_min: Some(90),
+        recur: Recur::Weekly,
+        calendar_id: friends,
+        tz: Some("America/New_York".into()),
+        ..Item::new(ItemKind::Appointment, "Book club", today)
+    })?;
+    db.save_item(&Item {
+        notes: "Gate code 4411.\nAsk for Sam at the desk.".into(),
+        ..Item::new(
+            ItemKind::Note,
+            "Visiting the studio",
+            today + Duration::days(1),
         )
     })?;
 

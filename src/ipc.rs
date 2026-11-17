@@ -14,6 +14,23 @@ pub struct Reply {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<Status>,
+    /// A machine-readable reason for a failure: `unknown_command` when this
+    /// instance is older than the command line talking to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+}
+
+impl Reply {
+    /// Whether the running instance did not know the command, as opposed to
+    /// failing at it. Instances from before `code` existed say so only in
+    /// the error text.
+    pub fn unknown_command(&self) -> bool {
+        self.code.as_deref() == Some("unknown_command")
+            || self
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("unknown variant"))
+    }
 }
 
 /// Sends a command to a running instance. `Err` means none is running (or it
@@ -59,6 +76,7 @@ fn handle(stream: UnixStream) {
             ok: true,
             error: None,
             status: Some(bridge::status()),
+            code: None,
         },
         Ok(Command::Quit) => {
             // Answer first: the process may be gone before a later reply.
@@ -74,13 +92,23 @@ fn handle(stream: UnixStream) {
                 ok: true,
                 error: None,
                 status: Some(bridge::status()),
+                code: None,
             }
         }
-        Err(e) => Reply {
-            ok: false,
-            error: Some(format!("bad request: {e}")),
-            status: None,
-        },
+        Err(e) => {
+            // Well-formed, but a command this build has never heard of: the
+            // sender is newer.
+            let named = serde_json::from_str::<serde_json::Value>(&line)
+                .ok()
+                .is_some_and(|v| v["cmd"].is_string());
+            let unknown = named && e.to_string().contains("unknown variant");
+            Reply {
+                ok: false,
+                error: Some(format!("bad request: {e}")),
+                status: None,
+                code: unknown.then(|| "unknown_command".to_string()),
+            }
+        }
     };
     if let Ok(mut out) = serde_json::to_string(&reply) {
         out.push('\n');
@@ -110,6 +138,28 @@ mod tests {
                 board: None
             }
         );
+        // The shape older command lines send, and fields this build adds.
+        let c: Command = serde_json::from_str(
+            r#"{"cmd":"event","title":"Club","date":"2026-12-01","time":"9pm","recur":"weekly","tz":"Eastern"}"#,
+        )
+        .unwrap();
+        let Command::Event(text) = c else {
+            panic!("not an event")
+        };
+        assert_eq!(
+            (
+                text.title.as_str(),
+                text.date.as_str(),
+                text.time.as_deref()
+            ),
+            ("Club", "2026-12-01", Some("9pm"))
+        );
+        assert_eq!(
+            (text.recur.as_deref(), text.tz.as_deref()),
+            (Some("weekly"), Some("Eastern"))
+        );
+        // Fields from a newer sender are ignored, not refused.
+        assert!(serde_json::from_str::<Command>(r#"{"cmd":"toggle","later":1}"#).is_ok());
         assert!(serde_json::from_str::<Command>(r#"{"cmd":"explode"}"#).is_err());
     }
 
@@ -132,6 +182,22 @@ mod tests {
         BufReader::new(s).read_line(&mut reply).unwrap();
         let r: Reply = serde_json::from_str(&reply).unwrap();
         assert!(!r.ok && r.error.is_some());
+        assert!(!r.unknown_command(), "garbage is not a newer command");
+
+        let mut s = UnixStream::connect(&path).unwrap();
+        s.write_all(b"{\"cmd\":\"teleport\",\"to\":\"mars\"}\n")
+            .unwrap();
+        let mut reply = String::new();
+        BufReader::new(s).read_line(&mut reply).unwrap();
+        let r: Reply = serde_json::from_str(&reply).unwrap();
+        assert!(!r.ok && r.unknown_command());
+        assert_eq!(r.code.as_deref(), Some("unknown_command"));
+        // What an instance from before `code` answers.
+        let old: Reply = serde_json::from_str(
+            r#"{"ok":false,"error":"bad request: unknown variant `event`, expected one of `toggle`"}"#,
+        )
+        .unwrap();
+        assert!(old.unknown_command());
 
         cleanup(&path);
         assert!(

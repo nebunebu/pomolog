@@ -12,10 +12,13 @@ const TABLES: &[&str] = &[
     "cards",
     "sessions",
     "interruptions",
+    "calendars",
     "items",
     "habits",
     "habit_entries",
 ];
+
+const DEFAULT_CALENDAR_SQL: &str = "INSERT OR IGNORE INTO calendars(id,name) VALUES(1,'Personal')";
 
 pub fn export(db: &Db) -> Result<Value> {
     let mut tables = Map::new();
@@ -119,6 +122,8 @@ pub fn import(db: &mut Db, data: &Value) -> std::result::Result<usize, ImportErr
             count += 1;
         }
     }
+    // Exports from before calendars existed have none.
+    tx.execute(DEFAULT_CALENDAR_SQL, [])?;
     tx.commit()?;
     Ok(count)
 }
@@ -128,6 +133,7 @@ pub fn wipe(db: &mut Db) -> Result<()> {
     for t in TABLES.iter().rev() {
         tx.execute(&format!("DELETE FROM {t}"), [])?;
     }
+    tx.execute(DEFAULT_CALENDAR_SQL, [])?;
     tx.commit()
 }
 
@@ -183,7 +189,7 @@ mod tests {
         let mut b = Db::open_in_memory().unwrap();
         b.add_board("Will be replaced").unwrap();
         let n = import(&mut b, &dump).unwrap();
-        assert_eq!(n, 1 + 3 + 1 + 1 + 1 + 1 + 1 + 1);
+        assert_eq!(n, 1 + 3 + 1 + 1 + 1 + 1 + 1 + 1 + 1);
         assert_eq!(export(&b).unwrap(), dump);
         let board = b.boards().unwrap()[0].id;
         assert_eq!(b.cards(board).unwrap()[0].spent_s, 1500);
@@ -211,9 +217,28 @@ mod tests {
     }
 
     #[test]
+    fn export_from_before_calendars_imports() {
+        let mut dump = export(&populated()).unwrap();
+        dump["schema"] = json!(1);
+        dump["tables"].as_object_mut().unwrap().remove("calendars");
+        let item = dump["tables"]["items"][0].as_object_mut().unwrap();
+        item.remove("calendar_id");
+        item.remove("tz");
+        let mut db = Db::open_in_memory().unwrap();
+        import(&mut db, &dump).unwrap();
+        assert_eq!(db.calendars().unwrap().len(), 1);
+        assert_eq!(db.items().unwrap()[0].calendar_id, DEFAULT_CALENDAR);
+    }
+
+    #[test]
     fn wipe_empties_everything() {
         let mut db = populated();
         wipe(&mut db).unwrap();
+        assert_eq!(
+            db.calendars().unwrap().len(),
+            1,
+            "the default calendar stays"
+        );
         assert!(db.boards().unwrap().is_empty());
         assert!(db.habits().unwrap().is_empty());
         assert!(db.items().unwrap().is_empty());

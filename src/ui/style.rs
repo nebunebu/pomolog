@@ -444,6 +444,10 @@ const ICONS: &[(&str, &str)] = &[
         r#"<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>"#,
     ),
     (
+        "note",
+        r#"<path d="M6 3h9l4 4v14H6zM15 3v4h4M9 12h7M9 16h5"/>"#,
+    ),
+    (
         "moon",
         r#"<path d="M20 14.500A8 8 0 0 1 9.500 4a8 8 0 1 0 10.500 10.500z"/>"#,
     ),

@@ -104,6 +104,29 @@ impl std::fmt::Display for Source {
     }
 }
 
+/// How times of day are written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Clock {
+    #[default]
+    #[serde(rename = "24h")]
+    H24,
+    #[serde(rename = "12h")]
+    H12,
+}
+
+impl Clock {
+    pub const ALL: [Clock; 2] = [Clock::H24, Clock::H12];
+}
+
+impl std::fmt::Display for Clock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Clock::H24 => "24-hour (21:00)",
+            Clock::H12 => "12-hour (9:00 PM)",
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TimerConf {
@@ -166,6 +189,8 @@ pub struct Appearance {
     pub compact: bool,
     /// Size of the whole interface: 1.0 is normal.
     pub scale: f32,
+    /// "24h" or "12h".
+    pub clock: Clock,
 }
 
 impl Default for Appearance {
@@ -178,6 +203,7 @@ impl Default for Appearance {
             radius: None,
             compact: false,
             scale: 1.0,
+            clock: Clock::H24,
         }
     }
 }
@@ -205,12 +231,66 @@ impl Default for Notifications {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Sounds {
+    pub enabled: bool,
+    /// 0.0 to 1.0.
+    pub volume: f32,
+    /// A focus phase runs out (or is finished in flow mode).
+    pub focus_end: bool,
+    /// A short or long break runs out.
+    pub break_end: bool,
+    /// A phase starts on its own because of auto-start.
+    pub auto_start: bool,
+    /// One minute left in a timed phase.
+    pub minute_warning: bool,
+    /// Optional sound files (wav, ogg, flac, mp3) used instead of the
+    /// built-in chimes. Empty means built-in.
+    pub focus_end_file: String,
+    pub break_end_file: String,
+    pub auto_start_file: String,
+    pub minute_warning_file: String,
+}
+
+impl Default for Sounds {
+    fn default() -> Self {
+        Sounds {
+            enabled: true,
+            volume: 0.6,
+            focus_end: true,
+            break_end: true,
+            auto_start: true,
+            minute_warning: false,
+            focus_end_file: String::new(),
+            break_end_file: String::new(),
+            auto_start_file: String::new(),
+            minute_warning_file: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Keys {
+    /// Single-letter navigation (h j k l and friends) outside text fields.
+    pub vim: bool,
+}
+
+impl Default for Keys {
+    fn default() -> Self {
+        Keys { vim: true }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub timer: TimerConf,
     pub appearance: Appearance,
     pub notifications: Notifications,
+    pub sounds: Sounds,
+    pub keys: Keys,
     /// Colour overrides applied on top of the chosen theme, e.g.
     /// `accent = "#ff8800"`.
     pub overrides: BTreeMap<String, String>,
@@ -262,6 +342,18 @@ mod tests {
             (Mode::Light, Source::Qt)
         );
         assert_eq!(c.overrides["accent"], "#ff8800");
+        assert!(c.keys.vim);
+        assert_eq!(c.sounds, Sounds::default());
+        let c: Config =
+            toml::from_str("[appearance]\nclock = \"12h\"\n[keys]\nvim = false\n").unwrap();
+        assert_eq!((c.appearance.clock, c.keys.vim), (Clock::H12, false));
+        let c: Config = toml::from_str(
+            "[sounds]\nvolume = 0.2\nminute_warning = true\nfocus_end_file = \"~/a.ogg\"\n",
+        )
+        .unwrap();
+        assert_eq!(c.sounds.volume, 0.2);
+        assert!(c.sounds.minute_warning && c.sounds.break_end);
+        assert_eq!(c.sounds.focus_end_file, "~/a.ogg");
     }
 
     #[test]
@@ -269,6 +361,8 @@ mod tests {
         let mut c = Config::default();
         c.appearance.radius = Some(4.0);
         c.overrides.insert("focus".into(), "#112233".into());
+        c.sounds.volume = 0.25;
+        c.sounds.break_end_file = "/tmp/x.wav".into();
         let text = toml::to_string_pretty(&c).unwrap();
         assert_eq!(toml::from_str::<Config>(&text).unwrap(), c);
     }

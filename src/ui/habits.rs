@@ -520,10 +520,19 @@ impl App {
         } else {
             column![left, right].spacing(p.u * 2.0).into()
         };
+        // Chosen with the keyboard.
+        let selected = self.habit_sel == Some(h.id);
         container(body)
             .padding(p.u * 2.0)
             .width(Fill)
-            .style(style::card(p))
+            .style(move |theme| {
+                let mut st = style::card(p)(theme);
+                if selected {
+                    st.border.color = p.accent;
+                    st.border.width = 2.0;
+                }
+                st
+            })
             .into()
     }
 

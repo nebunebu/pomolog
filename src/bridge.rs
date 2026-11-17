@@ -1,6 +1,7 @@
 //! The link between the GUI and the things outside it: the tray and the
 //! command-line socket. They send commands in and read a status snapshot out.
 
+use crate::core::model::ItemText;
 use serde::{Deserialize, Serialize};
 use std::sync::{Mutex, OnceLock};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -28,6 +29,9 @@ pub enum Command {
         #[serde(default)]
         board: Option<String>,
     },
+    /// Add a calendar item. Kept for command lines from before they wrote
+    /// to the database themselves.
+    Event(ItemText),
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
