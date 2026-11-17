@@ -37,6 +37,19 @@ you where the time went. A native Linux app written in Rust.
 
 Everything is stored locally in one SQLite file.
 
+## Screenshots
+
+![Today](docs/screenshots/today.png)
+
+| | |
+|---|---|
+| ![Board](docs/screenshots/board.png) | ![Calendar](docs/screenshots/calendar.png) |
+| ![Habits](docs/screenshots/habits.png) | ![Analytics](docs/screenshots/analytics.png) |
+
+![Timer](docs/screenshots/timer.png)
+
+Screenshots use the sample data from `cargo run --example seed`.
+
 ## Install
 
 Pomolog runs on Linux (x86_64 and aarch64), on Wayland or X11. It uses a
